@@ -2,8 +2,10 @@
 //!
 //! The look follows Ubuntu's Yaru / GNOME libadwaita style: a flat header bar, grouped cards,
 //! generous spacing, the Ubuntu typeface and a single orange accent, in light and dark.
+//! Choices are a draft until Apply, so a stray click never changes what the dock does.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -16,14 +18,24 @@ use egui_phosphor::regular as icon;
 use crate::backend::{self, Environment};
 use crate::device::DockEvent;
 use crate::model::{
-    Action, Button, Category, Config, DEVICE_NAME, Media, TargetOs, key_name_from_egui,
-    preset_for_action, presets_for, shortcut_keys,
+    Action, Button, CONTROLS, Category, Config, DEVICE_NAME, KNOB_LEFT, KNOB_PRESS, KNOB_RIGHT,
+    Media, TargetOs, is_knob, key_name_from_egui, preset_for_action, presets_for, shortcut_keys,
 };
 
 /// How long a pressed tile stays lit, in seconds.
 const GLOW_SECONDS: f64 = 0.9;
+/// How long the confirmation at the bottom stays visible, in seconds.
+const TOAST_SECONDS: f64 = 5.0;
 const LOG_LINES: usize = 60;
-const POSITIONS: [&str; 4] = ["Top left", "Top right", "Bottom left", "Bottom right"];
+const POSITIONS: [&str; CONTROLS] = [
+    "Top left",
+    "Top right",
+    "Bottom left",
+    "Bottom right",
+    "Turn left",
+    "Turn right",
+    "Press",
+];
 const ACCENT: Color32 = Color32::from_rgb(0xE9, 0x54, 0x20); // Ubuntu orange
 const MEDIUM: &str = "medium";
 
@@ -91,47 +103,86 @@ pub enum Connection {
     Disconnected,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelpTab {
+    Start,
+    Controls,
+    Questions,
+}
+
+/// The single status shown in the header, in plain words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Readiness {
+    Ready,
+    DockMissing,
+    LookingForDock,
+    NeedsInputMonitoring,
+    NeedsKarabiner,
+    NeedsApply,
+}
+
+/// Short confirmation at the bottom of the window.
+#[derive(Clone, Debug)]
+pub struct Toast {
+    pub ok: bool,
+    pub text: String,
+    shown_at: f64,
+}
+
 pub struct DockStudio {
+    /// What the user sees and edits (a draft until Apply).
     pub config: Config,
+    /// What was last applied - Discard returns to it.
+    pub applied: Config,
     pub selected: usize,
     pub learning: Option<usize>,
     pub connection: Connection,
-    pub status: Option<(bool, String)>,
+    pub toast: Option<Toast>,
     pub log: VecDeque<String>,
-    pub dirty: bool,
     /// Waiting for a key combination on the computer's keyboard.
     pub recording: bool,
     pub tab: Category,
-    pub help_open: bool,
+    pub help: Option<HelpTab>,
     pub show_activity: bool,
-    lit_at: [Option<f64>; 4],
+    /// "Reset everything" was clicked once and waits for a confirming second click.
+    pub confirm_reset: Option<f64>,
+    lit_at: [Option<f64>; CONTROLS],
     env: Environment,
     events: Receiver<DockEvent>,
     picked_app: Arc<Mutex<Option<String>>>,
     vendor_packets: usize,
+    now: f64,
 }
 
 impl DockStudio {
     pub fn new(env: Environment, events: Receiver<DockEvent>) -> Self {
         let config = Config::load_from(&env.config_file);
+        let applied_file = applied_path(&env);
+        let applied = if applied_file.exists() {
+            Config::load_from(&applied_file)
+        } else {
+            Config::default()
+        };
         let tab = tab_for(&config.buttons[0], config.target_os);
         DockStudio {
             config,
+            applied,
             selected: 0,
             learning: None,
             connection: Connection::Waiting,
-            status: None,
+            toast: None,
             log: VecDeque::new(),
-            dirty: false,
             recording: false,
             tab,
-            help_open: false,
+            help: None,
             show_activity: false,
-            lit_at: [None; 4],
+            confirm_reset: None,
+            lit_at: [None; CONTROLS],
             env,
             events,
             picked_app: Arc::new(Mutex::new(None)),
             vendor_packets: 0,
+            now: 0.0,
         }
     }
 
@@ -144,6 +195,40 @@ impl DockStudio {
         self.lit_at[index].is_some_and(|t| now - t < GLOW_SECONDS)
     }
 
+    /// Controls whose draft differs from what was applied.
+    pub fn changed_controls(&self) -> Vec<usize> {
+        (0..CONTROLS)
+            .filter(|&i| self.config.buttons[i] != self.applied.buttons[i])
+            .collect()
+    }
+
+    /// True when Apply would change something in Karabiner / keyd.
+    pub fn can_apply(&self) -> bool {
+        self.env.needs_apply(&self.config)
+    }
+
+    /// Whether the dock already does what the settings say.
+    pub fn readiness(&self) -> Readiness {
+        let customized = self
+            .config
+            .buttons
+            .iter()
+            .any(|b| b.action != Action::Original);
+        match &self.connection {
+            Connection::Disconnected => return Readiness::DockMissing,
+            Connection::Waiting => return Readiness::LookingForDock,
+            Connection::Connected { keyboard_ok: false } => return Readiness::NeedsInputMonitoring,
+            Connection::Connected { keyboard_ok: true } => {}
+        }
+        if cfg!(target_os = "macos") && customized && !self.env.karabiner_installed {
+            return Readiness::NeedsKarabiner;
+        }
+        if self.can_apply() {
+            return Readiness::NeedsApply;
+        }
+        Readiness::Ready
+    }
+
     fn push_log(&mut self, line: String) {
         if self.log.len() == LOG_LINES {
             self.log.pop_front();
@@ -151,14 +236,17 @@ impl DockStudio {
         self.log.push_back(line);
     }
 
-    fn save(&mut self) {
-        self.dirty = true;
-        self.persist();
+    fn show_toast(&mut self, ok: bool, text: String) {
+        self.toast = Some(Toast {
+            ok,
+            text,
+            shown_at: self.now,
+        });
     }
 
     fn persist(&mut self) {
         if let Err(err) = self.config.save_to(&self.env.config_file) {
-            self.status = Some((false, format!("Could not save settings: {err}")));
+            self.show_toast(false, format!("Could not save settings: {err}"));
         }
     }
 
@@ -168,10 +256,90 @@ impl DockStudio {
         self.recording = false;
     }
 
+    pub fn control_name(index: usize) -> String {
+        if is_knob(index) {
+            format!("Knob ({})", POSITIONS[index].to_lowercase())
+        } else {
+            format!("Button {}", index + 1)
+        }
+    }
+
+    /// Choose an action for the selected control (takes effect on Apply).
     fn assign(&mut self, action: Action) {
         self.config.buttons[self.selected].action = action;
         self.recording = false;
-        self.save();
+        self.persist();
+    }
+
+    /// Make the dock follow the draft.
+    pub fn apply(&mut self) {
+        if cfg!(target_os = "macos") && !self.env.karabiner_installed {
+            self.show_toast(
+                false,
+                "Install Karabiner-Elements first - your choices are saved".into(),
+            );
+            return;
+        }
+        let changes: Vec<String> = self
+            .changed_controls()
+            .into_iter()
+            .map(|i| {
+                format!(
+                    "{} → {}",
+                    Self::control_name(i),
+                    action_name(&self.config.buttons[i].action, self.config.target_os)
+                )
+            })
+            .collect();
+        let all_factory = self
+            .config
+            .buttons
+            .iter()
+            .all(|b| b.action == Action::Original);
+        let result = if all_factory {
+            self.env.remove()
+        } else {
+            self.env.apply(&self.config)
+        };
+        match result {
+            Ok(_) => {
+                self.applied = self.config.clone();
+                if let Err(err) = self.applied.save_to(&applied_path(&self.env)) {
+                    self.show_toast(false, format!("Applied, but could not remember it: {err}"));
+                    return;
+                }
+                let text = if changes.is_empty() {
+                    "Applied - press a control on the dock to try it".to_string()
+                } else {
+                    format!("Applied: {}", changes.join(", "))
+                };
+                self.show_toast(true, text);
+            }
+            Err(err) => self.show_toast(false, format!("Could not apply: {err}")),
+        }
+    }
+
+    /// Throw the draft away and return to what is active.
+    pub fn discard(&mut self) {
+        let keep = (self.config.target_os, self.config.seen_guide);
+        self.config = self.applied.clone();
+        (self.config.target_os, self.config.seen_guide) = keep;
+        self.persist();
+        self.tab = tab_for(&self.config.buttons[self.selected], self.config.target_os);
+        self.show_toast(true, "Changes discarded".into());
+    }
+
+    /// Every control back to factory behaviour, and QuadKey's rule removed.
+    pub fn reset_everything(&mut self) {
+        let keep = (self.config.target_os, self.config.seen_guide);
+        self.config = Config::default();
+        (self.config.target_os, self.config.seen_guide) = keep;
+        self.persist();
+        self.tab = tab_for(&self.config.buttons[self.selected], self.config.target_os);
+        if self.can_apply() {
+            self.apply();
+        }
+        self.show_toast(true, "Everything is back to factory behaviour".into());
     }
 
     /// Drain the events coming from the HID and UDP threads.
@@ -192,25 +360,35 @@ impl DockStudio {
                 DockEvent::Pressed(trigger) => {
                     if let Some(index) = self.learning.take() {
                         self.config.buttons[index].trigger = trigger;
-                        self.save();
+                        self.persist();
                         self.selected = index;
                         self.lit_at[index] = Some(now);
-                        self.push_log(format!("Button {} learned: {}", index + 1, trigger.label()));
+                        self.push_log(format!(
+                            "{} learned: {}",
+                            Self::control_name(index),
+                            trigger.label()
+                        ));
                         continue;
                     }
                     match self.config.button_for(&trigger) {
                         Some(index) => {
                             self.lit_at[index] = Some(now);
-                            backend::run_local_action(&self.config.buttons[index].action);
-                            self.push_log(format!("Button {}  {}", index + 1, trigger.label()));
+                            backend::run_local_action(index, &self.applied.buttons[index].action);
+                            let outcome = self.outcome(index);
+                            self.push_log(format!(
+                                "{} · dock sent {} → {outcome}",
+                                Self::control_name(index),
+                                trigger.label()
+                            ));
                         }
-                        None => self.push_log(format!("Unknown input  {}", trigger.label())),
+                        None => self.push_log(format!("Unknown input {}", trigger.label())),
                     }
                 }
                 DockEvent::PressedButton(index) => {
-                    if index < 4 {
+                    if index < CONTROLS {
                         self.lit_at[index] = Some(now);
-                        self.push_log(format!("Button {}  (via Karabiner)", index + 1));
+                        let outcome = self.outcome(index);
+                        self.push_log(format!("{} → {outcome}", Self::control_name(index)));
                     }
                 }
                 DockEvent::Released => {}
@@ -222,21 +400,27 @@ impl DockStudio {
         }
     }
 
-    pub fn apply(&mut self) {
-        self.status = Some(match self.env.apply(&self.config) {
-            Ok(message) => {
-                self.dirty = false;
-                (true, message)
-            }
-            Err(err) => (false, err.to_string()),
-        });
-    }
-
-    pub fn remove_rule(&mut self) {
-        self.status = Some(match self.env.remove() {
-            Ok(message) => (true, message),
-            Err(err) => (false, err.to_string()),
-        });
+    /// What really happened for a press, for the activity log.
+    fn outcome(&self, index: usize) -> String {
+        let active = &self.applied.buttons[index].action;
+        let draft = &self.config.buttons[index].action;
+        let os = self.config.target_os;
+        let mut text = if *active == Action::Original
+            || self.readiness() != Readiness::Ready
+                && self.can_apply()
+                && self.applied == Config::default()
+        {
+            "factory setting".to_string()
+        } else {
+            action_name(active, os)
+        };
+        if draft != active {
+            text.push_str(&format!(
+                " (your change to \"{}\" is not applied yet)",
+                action_name(draft, os)
+            ));
+        }
+        text
     }
 
     /// While recording, the next key combination typed on the keyboard becomes the action.
@@ -286,10 +470,22 @@ impl DockStudio {
             return;
         }
         let now = ui.input(|i| i.time);
+        self.now = now;
         self.process_events(now);
         self.record_shortcut(ui);
         if self.lit_at.iter().flatten().any(|t| now - t < GLOW_SECONDS) {
-            ui.ctx().request_repaint(); // keep animating the glow
+            ui.ctx().request_repaint();
+        }
+        if let Some(toast) = &self.toast {
+            if now - toast.shown_at > TOAST_SECONDS {
+                self.toast = None;
+            } else {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(250));
+            }
+        }
+        if self.confirm_reset.is_some_and(|t| now - t > 4.0) {
+            self.confirm_reset = None;
         }
         let pal = Palette::of(ui);
 
@@ -322,7 +518,7 @@ impl DockStudio {
                     });
             });
 
-        self.guide(ui.ctx(), pal);
+        self.help_dialog(ui.ctx(), pal);
     }
 
     fn header(&mut self, ui: &mut egui::Ui, pal: Palette) {
@@ -333,51 +529,81 @@ impl DockStudio {
             ui.label(RichText::new(DEVICE_NAME).size(14.0).color(pal.dim));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                if ui
-                    .add(pill_button(
-                        &format!("{}  Help", icon::QUESTION),
-                        pal,
-                        false,
-                    ))
-                    .on_hover_text("How QuadKey works")
-                    .clicked()
-                {
-                    self.help_open = true;
+                self.more_menu(ui, pal);
+                if ui.add(pill_button(&format!("{}  Help", icon::QUESTION), pal, false)).on_hover_text("What everything does").clicked() {
+                    self.help = Some(HelpTab::Start);
                 }
-                let (color, text) = match &self.connection {
-                    Connection::Connected { keyboard_ok: true } => {
-                        (pal.ok, "Dock connected".to_string())
-                    }
-                    Connection::Connected { keyboard_ok: false } => {
-                        (pal.warn, "Connected - allow Input Monitoring".to_string())
-                    }
-                    Connection::Disconnected => (pal.err, "Dock not connected".to_string()),
-                    Connection::Waiting => (pal.dim, "Looking for the dock...".to_string()),
+                let (color, text, why) = match self.readiness() {
+                    Readiness::Ready => (pal.ok, "Ready", "The dock does what you see here. Use it to try."),
+                    Readiness::DockMissing => (pal.err, "Dock not connected", "Plug the dock into this computer."),
+                    Readiness::LookingForDock => (pal.dim, "Looking for the dock...", "QuadKey is searching for the dock."),
+                    Readiness::NeedsInputMonitoring => (
+                        pal.warn,
+                        "Allow Input Monitoring",
+                        "System Settings → Privacy & Security → Input Monitoring: turn QuadKey (or your terminal) on, then restart QuadKey.",
+                    ),
+                    Readiness::NeedsKarabiner => (
+                        pal.warn,
+                        "Install Karabiner-Elements",
+                        "Your choices are saved, but macOS needs Karabiner-Elements to change what the dock does. Install it once, then click Apply.",
+                    ),
+                    Readiness::NeedsApply => (pal.warn, "Changes not applied", "Click Apply at the bottom to make the dock use your choices."),
                 };
-                status_pill(ui, pal, color, &text);
-                if cfg!(target_os = "macos") {
-                    let (color, text) = if !self.env.karabiner_installed {
-                        (pal.warn, "Karabiner-Elements not installed")
-                    } else if self.env.rule_active() {
-                        (pal.ok, "Karabiner rule active")
-                    } else {
-                        (pal.dim, "Karabiner rule not applied")
-                    };
-                    status_pill(ui, pal, color, text);
-                }
-                // Which system's shortcuts the quick picks use - the user decides
-                let mut os = self.config.target_os;
-                for choice in [TargetOs::Linux, TargetOs::Mac] {
-                    ui.selectable_value(&mut os, choice, RichText::new(choice.label()).size(13.0));
-                }
-                ui.label(RichText::new("Shortcuts for").size(13.0).color(pal.dim));
-                if os != self.config.target_os {
+                status_pill(ui, pal, color, text).on_hover_text(why);
+            });
+        });
+    }
+
+    /// Settings most people never need, kept out of the way.
+    fn more_menu(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        let menu = egui::containers::menu::MenuButton::from_button(pill_button(
+            icon::DOTS_THREE,
+            pal,
+            false,
+        ));
+        let (response, _) = menu.ui(ui, |ui| {
+            ui.set_min_width(260.0);
+            ui.label(RichText::new("Shortcuts are for").size(12.0).color(pal.dim));
+            for os in [TargetOs::Mac, TargetOs::Linux] {
+                if ui.radio(self.config.target_os == os, os.label()).clicked()
+                    && self.config.target_os != os
+                {
                     self.config.target_os = os;
                     self.tab = tab_for(&self.config.buttons[self.selected], os);
                     self.persist();
                 }
-            });
+            }
+            ui.separator();
+            let text = if self.show_activity {
+                "Hide activity"
+            } else {
+                "Show activity"
+            };
+            if ui
+                .button(format!("{}  {text}", icon::LIST_BULLETS))
+                .clicked()
+            {
+                self.show_activity = !self.show_activity;
+                ui.close();
+            }
+            let reset = if self.confirm_reset.is_some() {
+                "Click again to reset everything"
+            } else {
+                "Reset everything to factory"
+            };
+            if ui
+                .button(format!("{}  {reset}", icon::ARROW_COUNTER_CLOCKWISE))
+                .clicked()
+            {
+                if self.confirm_reset.take().is_some() {
+                    self.reset_everything();
+                    ui.close();
+                } else {
+                    self.confirm_reset = Some(self.now);
+                }
+            }
         });
+        response.on_hover_text("More: macOS/Linux shortcuts, activity, reset");
     }
 
     fn dock_card(&mut self, ui: &mut egui::Ui, pal: Palette, now: f64) {
@@ -389,7 +615,7 @@ impl DockStudio {
                         .color(pal.text),
                 );
                 ui.label(
-                    RichText::new("Click a button to change it")
+                    RichText::new("Click a control to change it")
                         .size(13.0)
                         .color(pal.dim),
                 );
@@ -402,10 +628,17 @@ impl DockStudio {
                         }
                     });
                 }
+                ui.add_space(6.0);
+                ui.label(RichText::new("Knob").font(medium(14.0)).color(pal.text));
+                ui.horizontal(|ui| {
+                    for index in [KNOB_LEFT, KNOB_PRESS, KNOB_RIGHT] {
+                        self.tile(ui, pal, index, now);
+                    }
+                });
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new(format!(
-                        "{}  Press a button on the dock - it lights up here",
+                        "{}  Use the dock - the matching tile lights up",
                         icon::HAND_POINTING
                     ))
                     .size(12.0)
@@ -416,14 +649,24 @@ impl DockStudio {
     }
 
     fn tile(&mut self, ui: &mut egui::Ui, pal: Palette, index: usize, now: f64) {
-        let size = Vec2::new(168.0, 140.0);
+        let knob = is_knob(index);
+        let size = if knob {
+            Vec2::new(104.0, 96.0)
+        } else {
+            Vec2::new(168.0, 140.0)
+        };
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
         // Accessible name differs from the editor title ("Button 3") so both can be found
-        let label = format!("Dock button {}", index + 1);
+        let label = if knob {
+            format!("Knob: {}", POSITIONS[index].to_lowercase())
+        } else {
+            format!("Dock button {}", index + 1)
+        };
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
         let button = &self.config.buttons[index];
+        let changed = button != &self.applied.buttons[index];
         let preset = preset_for_action(&button.action, self.config.target_os);
         let glow = self.lit_at[index].map_or(0.0, |t| {
             (1.0 - ((now - t) / GLOW_SECONDS)).clamp(0.0, 1.0) as f32
@@ -433,7 +676,7 @@ impl DockStudio {
 
         // Pressed tiles sink slightly and glow in the accent color
         let rect = rect.shrink(glow * 2.0);
-        let radius = CornerRadius::same(16);
+        let radius = CornerRadius::same(if knob { 14 } else { 16 });
         let painter = ui.painter();
         let shadow = egui::epaint::Shadow {
             offset: [0, 2],
@@ -448,8 +691,7 @@ impl DockStudio {
             pal.card
         };
         let tint: f32 = if selected { 0.6 } else { 0.0 };
-        let fill = lerp(base, pal.accent_tint, tint.max(glow));
-        painter.rect_filled(rect, radius, fill);
+        painter.rect_filled(rect, radius, lerp(base, pal.accent_tint, tint.max(glow)));
         let stroke = if learning {
             Stroke::new(2.0, pal.warn)
         } else if selected || glow > 0.0 {
@@ -459,48 +701,72 @@ impl DockStudio {
         };
         painter.rect_stroke(rect, radius, stroke, StrokeKind::Inside);
 
-        let pad = 16.0;
-        let glyph = preset
-            .as_ref()
-            .map_or_else(|| action_icon(&button.action), |p| p.icon);
+        let pad = if knob { 12.0 } else { 16.0 };
+        let glyph = preset.as_ref().map_or_else(|| icon_for(button), |p| p.icon);
+        let highlight = if selected || glow > 0.0 {
+            ACCENT
+        } else {
+            pal.dim
+        };
         painter.text(
             rect.left_top() + Vec2::new(pad, pad),
             Align2::LEFT_TOP,
             glyph,
-            FontId::proportional(24.0),
-            if selected || glow > 0.0 {
-                ACCENT
-            } else {
-                pal.dim
-            },
+            FontId::proportional(if knob { 18.0 } else { 24.0 }),
+            highlight,
         );
+        let corner = match index {
+            KNOB_LEFT => icon::ARROW_COUNTER_CLOCKWISE.to_string(),
+            KNOB_RIGHT => icon::ARROW_CLOCKWISE.to_string(),
+            KNOB_PRESS => icon::CIRCLE.to_string(),
+            _ => format!("{}", index + 1),
+        };
         painter.text(
             rect.right_top() + Vec2::new(-pad, pad + 2.0),
             Align2::RIGHT_TOP,
-            format!("{}", index + 1),
+            corner,
             medium(13.0),
             pal.dim,
         );
+        if changed {
+            // Not applied yet: a small dot next to the number
+            painter.circle_filled(
+                rect.right_top() + Vec2::new(-pad - 18.0, pad + 9.0),
+                4.0,
+                pal.warn,
+            );
+        }
+        let title = tile_title(button, preset.as_ref().map(|p| p.name));
+        let (title_size, chars) = if knob { (12.5, 12) } else { (15.0, 17) };
         painter.text(
-            rect.left_bottom() + Vec2::new(pad, -pad - 18.0),
+            rect.left_bottom() + Vec2::new(pad, -pad - if knob { 14.0 } else { 18.0 }),
             Align2::LEFT_BOTTOM,
-            truncate(&tile_title(button, preset.as_ref().map(|p| p.name)), 17),
-            medium(15.0),
+            truncate(&title, chars),
+            medium(title_size),
             pal.text,
         );
         let sub = if learning {
             "Press it on the dock...".to_string()
+        } else if changed {
+            "not applied yet".to_string()
+        } else if knob {
+            POSITIONS[index].to_string()
         } else if button.action == Action::Original {
             "factory setting".to_string()
         } else {
             truncate(&button.trigger.label(), 22)
         };
+        let sub_color = if learning || changed {
+            pal.warn
+        } else {
+            pal.dim
+        };
         painter.text(
             rect.left_bottom() + Vec2::new(pad, -pad),
             Align2::LEFT_BOTTOM,
             sub,
-            FontId::proportional(12.0),
-            if learning { pal.warn } else { pal.dim },
+            FontId::proportional(if knob { 11.0 } else { 12.0 }),
+            sub_color,
         );
         if response.clicked() {
             self.select(index);
@@ -512,31 +778,31 @@ impl DockStudio {
         ui.set_min_width(460.0);
         let trigger = self.config.buttons[index].trigger;
 
-        // Title and what the dock sends
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("Button {}", index + 1))
-                    .font(medium(22.0))
-                    .color(pal.text),
-            );
+            let title = if is_knob(index) {
+                "Knob".to_string()
+            } else {
+                format!("Button {}", index + 1)
+            };
+            ui.label(RichText::new(title).font(medium(22.0)).color(pal.text));
             ui.label(RichText::new(POSITIONS[index]).size(15.0).color(pal.dim));
         });
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("The dock sends").size(13.0).color(pal.dim));
-            ui.label(
-                RichText::new(trigger.label())
-                    .monospace()
-                    .size(13.0)
-                    .color(pal.text),
-            );
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Out of the box it sends").size(13.0).color(pal.dim));
+            ui.label(RichText::new(trigger.label()).monospace().size(13.0).color(pal.text));
             if let Some(meaning) = trigger.meaning() {
-                let os = if cfg!(target_os = "macos") {
-                    "macOS"
-                } else {
-                    "Linux"
-                };
+                let os = if cfg!(target_os = "macos") { "macOS" } else { "Linux" };
                 status_pill(ui, pal, pal.warn, &format!("{os}: {meaning}"));
+            }
+            let learning = self.learning == Some(index);
+            let text = if learning { "Cancel learning" } else { "Learn from dock" };
+            if ui
+                .link(RichText::new(text).size(13.0))
+                .on_hover_text("Only needed if using this control does not light up its tile: click, then use the control on the dock so QuadKey recognises it.")
+                .clicked()
+            {
+                self.learning = if learning { None } else { Some(index) };
             }
         });
         ui.add_space(16.0);
@@ -551,50 +817,63 @@ impl DockStudio {
                     let preset = preset_for_action(&action, self.config.target_os);
                     let glyph = preset
                         .as_ref()
-                        .map_or_else(|| action_icon(&action), |p| p.icon);
+                        .map_or_else(|| icon_for(&self.config.buttons[index]), |p| p.icon);
                     ui.label(RichText::new(glyph).size(22.0).color(ACCENT));
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Current action").size(12.0).color(pal.dim));
-                        let name = preset.as_ref().map_or_else(
-                            || tile_title(&self.config.buttons[index], None),
-                            |p| p.name.to_string(),
+                        let changed = self.config.buttons[index] != self.applied.buttons[index];
+                        let caption = if changed {
+                            "Will do after Apply"
+                        } else {
+                            "Does now"
+                        };
+                        ui.label(RichText::new(caption).size(12.0).color(if changed {
+                            pal.warn
+                        } else {
+                            pal.dim
+                        }));
+                        ui.label(
+                            RichText::new(action_name(&action, self.config.target_os))
+                                .font(medium(16.0))
+                                .color(pal.text),
                         );
-                        ui.label(RichText::new(name).font(medium(16.0)).color(pal.text));
+                        if action.needs_computer() {
+                            ui.label(
+                                RichText::new(
+                                    "Runs on this computer while QuadKey or Karabiner is active",
+                                )
+                                .size(12.0)
+                                .color(pal.dim),
+                            );
+                        }
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(pill_button("Reset button", pal, false))
-                            .on_hover_text("Back to the factory behaviour")
-                            .clicked()
+                        if action != Action::Original
+                            && ui
+                                .add(pill_button("Back to factory", pal, false))
+                                .on_hover_text(
+                                    "Give this control its out-of-the-box behaviour back",
+                                )
+                                .clicked()
                         {
                             let defaults = Config::default();
                             self.config.buttons[index] = defaults.buttons[index].clone();
                             self.tab = tab_for(&self.config.buttons[index], self.config.target_os);
-                            self.save();
-                        }
-                        let learning = self.learning == Some(index);
-                        let text = if learning {
-                            "Cancel learning"
-                        } else {
-                            "Learn from dock"
-                        };
-                        if ui
-                            .add(pill_button(text, pal, false))
-                            .on_hover_text("Press this button on the dock so QuadKey recognises it")
-                            .clicked()
-                        {
-                            self.learning = if learning { None } else { Some(index) };
+                            self.persist();
                         }
                     });
                 });
             });
         ui.add_space(20.0);
 
-        // Category tabs
         ui.label(
-            RichText::new("Choose what the button does")
+            RichText::new("Choose what it does")
                 .font(medium(15.0))
                 .color(pal.text),
+        );
+        ui.label(
+            RichText::new("Pick an action, then click Apply at the bottom.")
+                .size(13.0)
+                .color(pal.dim),
         );
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
@@ -616,7 +895,7 @@ impl DockStudio {
         }
     }
 
-    /// One click assigns a common action.
+    /// One click picks a common action.
     fn preset_grid(&mut self, ui: &mut egui::Ui, pal: Palette, index: usize) {
         let os = self.config.target_os;
         let presets: Vec<_> = presets_for(os)
@@ -631,7 +910,7 @@ impl DockStudio {
             .show(ui, |ui| {
                 for (i, (preset, action)) in presets.into_iter().enumerate() {
                     let active = self.config.buttons[index].action == action;
-                    // Shortcuts show their keys; media keys are already described by the hint
+                    // Shortcuts show their keys; other actions are described by the hint
                     let hint = match &action {
                         Action::Shortcut { .. } => {
                             format!("{} · {}", preset.hint, action.summary())
@@ -653,7 +932,9 @@ impl DockStudio {
     fn custom(&mut self, ui: &mut egui::Ui, pal: Palette, index: usize) {
         let width = ((ui.available_width() - 12.0) / 2.0).max(200.0);
         let action = self.config.buttons[index].action.clone();
-        let is = |kind: fn(&Action) -> bool| kind(&action);
+        let is =
+            |example: &Action| std::mem::discriminant(&action) == std::mem::discriminant(example);
+        let os = self.config.target_os;
         egui::Grid::new("custom")
             .num_columns(2)
             .spacing(Vec2::splat(12.0))
@@ -664,81 +945,111 @@ impl DockStudio {
                 } else {
                     ("Record shortcut", "Type any key combination to send")
                 };
-                if option_card(ui, pal, icon::KEYBOARD, title, hint, recording, width).clicked() {
+                if option_card(ui, pal, icon::RECORD, title, hint, recording, width).clicked() {
                     self.recording = !self.recording;
                 }
+                let keys = Action::Shortcut {
+                    ctrl: false,
+                    alt: false,
+                    shift: true,
+                    cmd: true,
+                    key: "5".into(),
+                };
                 if option_card(
                     ui,
                     pal,
                     icon::KEYBOARD,
                     "Choose keys",
                     "Pick modifiers and a key",
-                    is(|a| matches!(a, Action::Shortcut { .. })),
+                    is(&keys),
                     width,
                 )
                 .clicked()
-                    && !matches!(action, Action::Shortcut { .. })
+                    && !is(&keys)
                 {
-                    self.assign(Action::Shortcut {
-                        ctrl: false,
-                        alt: false,
-                        shift: true,
-                        cmd: true,
-                        key: "5".into(),
-                    });
+                    self.assign(keys);
                 }
                 ui.end_row();
+                let app = Action::OpenApp { app: String::new() };
                 if option_card(
                     ui,
                     pal,
                     icon::APP_WINDOW,
                     "Open application",
                     "Start or bring up an app",
-                    is(|a| matches!(a, Action::OpenApp { .. })),
+                    is(&app),
                     width,
                 )
                 .clicked()
-                    && !matches!(action, Action::OpenApp { .. })
+                    && !is(&app)
                 {
-                    self.assign(Action::OpenApp { app: String::new() });
+                    self.assign(app);
                 }
+                let command = Action::Command {
+                    command: String::new(),
+                };
                 if option_card(
                     ui,
                     pal,
                     icon::TERMINAL,
                     "Run command",
                     "Any shell command you write",
-                    is(|a| matches!(a, Action::Command { .. })),
+                    is(&command),
                     width,
                 )
                 .clicked()
-                    && !matches!(action, Action::Command { .. })
+                    && !is(&command)
                 {
-                    self.assign(Action::Command {
-                        command: String::new(),
-                    });
+                    self.assign(command);
                 }
                 ui.end_row();
+                let toggle = {
+                    let first = presets_for(os)
+                        .into_iter()
+                        .find(|(p, _)| p.name == "Mute microphone (all apps)")
+                        .map(|(_, a)| a);
+                    Action::Toggle {
+                        first: Box::new(first.unwrap_or(Action::Media { key: Media::Mute })),
+                        second: Box::new(Action::Media {
+                            key: Media::PlayPause,
+                        }),
+                    }
+                };
+                if option_card(
+                    ui,
+                    pal,
+                    icon::TOGGLE_LEFT,
+                    "Toggle between two",
+                    "1st press does one thing, 2nd press another",
+                    is(&toggle),
+                    width,
+                )
+                .clicked()
+                    && !is(&toggle)
+                {
+                    self.assign(toggle);
+                }
                 if option_card(
                     ui,
                     pal,
                     icon::PROHIBIT,
                     "Do nothing",
-                    "Ignore the button completely",
-                    is(|a| *a == Action::Disabled),
+                    "Ignore it completely",
+                    action == Action::Disabled,
                     width,
                 )
                 .clicked()
                 {
                     self.assign(Action::Disabled);
                 }
+                ui.end_row();
                 if option_card(
                     ui,
                     pal,
                     icon::ARROW_COUNTER_CLOCKWISE,
                     "Factory setting",
                     "Keep what the dock sends by itself",
-                    is(|a| *a == Action::Original),
+                    action == Action::Original,
                     width,
                 )
                 .clicked()
@@ -754,7 +1065,8 @@ impl DockStudio {
     fn custom_details(&mut self, ui: &mut egui::Ui, pal: Palette, index: usize) {
         let mut changed = false;
         let picked = self.picked_app.clone();
-        let target_mac = self.config.target_os == TargetOs::Mac;
+        let os = self.config.target_os;
+        let target_mac = os == TargetOs::Mac;
         match &mut self.config.buttons[index].action {
             Action::Shortcut {
                 ctrl,
@@ -763,10 +1075,7 @@ impl DockStudio {
                 cmd,
                 key,
             } => {
-                card(pal).inner_margin(Margin::same(14)).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(RichText::new("Keys to send").size(12.0).color(pal.dim));
-                    ui.add_space(6.0);
+                section(ui, pal, "Keys to send", |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         let names = if target_mac {
@@ -793,10 +1102,7 @@ impl DockStudio {
                 });
             }
             Action::OpenApp { app } => {
-                card(pal).inner_margin(Margin::same(14)).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(RichText::new("Application").size(12.0).color(pal.dim));
-                    ui.add_space(6.0);
+                section(ui, pal, "Application", |ui| {
                     ui.horizontal(|ui| {
                         let hint = if cfg!(target_os = "macos") {
                             "Zoom or /Applications/Zoom.app"
@@ -819,10 +1125,7 @@ impl DockStudio {
                 });
             }
             Action::Command { command } => {
-                card(pal).inner_margin(Margin::same(14)).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(RichText::new("Shell command").size(12.0).color(pal.dim));
-                    ui.add_space(6.0);
+                section(ui, pal, "Shell command", |ui| {
                     changed |= ui
                         .add(
                             egui::TextEdit::singleline(command)
@@ -832,9 +1135,52 @@ impl DockStudio {
                         .changed();
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new("Runs with your user's shell when the button is pressed.")
+                        RichText::new("Runs with your user's shell when the control is used.")
                             .size(12.0)
                             .color(pal.dim),
+                    );
+                });
+            }
+            Action::Toggle { first, second } => {
+                section(ui, pal, "Toggle", |ui| {
+                    for (label, half, salt) in [
+                        ("First press", first, "toggle_first"),
+                        ("Second press", second, "toggle_second"),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [110.0, 20.0],
+                                egui::Label::new(RichText::new(label).size(13.0).color(pal.text)),
+                            );
+                            egui::ComboBox::from_id_salt(salt)
+                                .selected_text(action_name(half, os))
+                                .width(280.0)
+                                .show_ui(ui, |ui| {
+                                    let mut choices: Vec<(String, Action)> = presets_for(os)
+                                        .into_iter()
+                                        .map(|(p, a)| {
+                                            (format!("{} · {}", p.category.label(), p.name), a)
+                                        })
+                                        .collect();
+                                    choices.push(("Do nothing".into(), Action::Disabled));
+                                    for (name, action) in choices {
+                                        let selected = **half == action;
+                                        if ui.selectable_label(selected, name).clicked()
+                                            && !selected
+                                        {
+                                            **half = action;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        });
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Press once for the first action, again for the second, and so on.",
+                        )
+                        .size(12.0)
+                        .color(pal.dim),
                     );
                 });
             }
@@ -852,13 +1198,14 @@ impl DockStudio {
             Action::Original | Action::Disabled => {}
         }
         if changed {
-            self.save();
+            self.persist();
         }
     }
 
     fn footer(&mut self, ui: &mut egui::Ui, pal: Palette) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
+            let can_apply = self.can_apply();
             let apply = egui::Button::new(
                 RichText::new("Apply")
                     .font(medium(15.0))
@@ -867,72 +1214,74 @@ impl DockStudio {
             .fill(ACCENT)
             .corner_radius(CornerRadius::same(18))
             .min_size(Vec2::new(120.0, 38.0));
-            if ui
-                .add(apply)
-                .on_hover_text("Make the dock use these actions")
-                .clicked()
-            {
+            let response = ui.add_enabled(can_apply, apply);
+            let response = if can_apply {
+                let how = if cfg!(target_os = "linux") {
+                    " (asks for the administrator password)"
+                } else {
+                    ""
+                };
+                response.on_hover_text(format!("Make the dock use your choices{how}"))
+            } else {
+                response
+                    .on_disabled_hover_text("Nothing to apply - the dock already does what you see")
+            };
+            if response.clicked() {
                 self.apply();
             }
-            if cfg!(target_os = "macos")
-                && ui
-                    .add(pill_button("Remove rule", pal, false))
-                    .on_hover_text("Give the dock its factory behaviour back")
-                    .clicked()
+            let changes = self.changed_controls().len();
+            if ui
+                .add_enabled(changes > 0, pill_button("Discard", pal, false))
+                .on_hover_text("Throw away the changes and go back to what is active")
+                .clicked()
             {
-                self.remove_rule();
+                self.discard();
             }
-            if self.dirty {
-                ui.label(
-                    RichText::new(format!("{}  Unapplied changes", icon::DOT_OUTLINE))
-                        .size(13.0)
-                        .color(pal.warn),
-                );
-            }
-            if let Some((ok, message)) = &self.status {
-                ui.label(RichText::new(message).size(13.0).color(if *ok {
-                    pal.ok
-                } else {
-                    pal.err
-                }));
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let text = if self.show_activity {
-                    "Hide activity"
-                } else {
-                    "Activity"
-                };
-                if ui
-                    .add(pill_button(
-                        &format!("{}  {text}", icon::LIST_BULLETS),
-                        pal,
-                        self.show_activity,
-                    ))
-                    .clicked()
-                {
-                    self.show_activity = !self.show_activity;
+            match &self.toast {
+                Some(toast) => {
+                    let (glyph, color) = if toast.ok {
+                        (icon::CHECK_CIRCLE, pal.ok)
+                    } else {
+                        (icon::WARNING_CIRCLE, pal.err)
+                    };
+                    ui.label(RichText::new(glyph).size(18.0).color(color));
+                    ui.label(RichText::new(&toast.text).size(14.0).color(pal.text));
                 }
-            });
+                None if changes > 0 => {
+                    let text = if changes == 1 {
+                        "1 change not applied".to_string()
+                    } else {
+                        format!("{changes} changes not applied")
+                    };
+                    ui.label(RichText::new(text).size(13.0).color(pal.warn));
+                }
+                None => {
+                    let hint = match self.readiness() {
+                        Readiness::NeedsKarabiner => {
+                            "Install Karabiner-Elements to make your choices work."
+                        }
+                        _ => "All saved. Pick a control to change it.",
+                    };
+                    ui.label(RichText::new(hint).size(13.0).color(pal.dim));
+                }
+            }
+            if cfg!(target_os = "macos") && !self.env.karabiner_installed {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.link("Get Karabiner-Elements").clicked() {
+                        let _ = std::process::Command::new("open")
+                            .arg("https://karabiner-elements.pqrs.org/")
+                            .spawn();
+                    }
+                });
+            }
         });
-        if cfg!(target_os = "macos") && !self.env.karabiner_installed {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(
-                        "QuadKey needs Karabiner-Elements to take over the dock on macOS.",
-                    )
-                    .size(12.0)
-                    .color(pal.dim),
-                );
-                if ui.link("Install Karabiner-Elements").clicked() {
-                    let _ = std::process::Command::new("open")
-                        .arg("https://karabiner-elements.pqrs.org/")
-                        .spawn();
-                }
-            });
-        }
         if self.show_activity {
             ui.add_space(8.0);
+            ui.label(
+                RichText::new("Activity - what the dock sent and what happened")
+                    .size(12.0)
+                    .color(pal.dim),
+            );
             egui::ScrollArea::vertical()
                 .max_height(100.0)
                 .stick_to_bottom(true)
@@ -940,7 +1289,7 @@ impl DockStudio {
                     ui.set_width(ui.available_width());
                     if self.log.is_empty() {
                         ui.label(
-                            RichText::new("Nothing yet - press a button on the dock.")
+                            RichText::new("Nothing yet - use the dock.")
                                 .size(12.0)
                                 .color(pal.dim),
                         );
@@ -960,70 +1309,255 @@ impl DockStudio {
     }
 
     /// Welcome guide on first start, and the Help dialog afterwards.
-    fn guide(&mut self, ctx: &egui::Context, pal: Palette) {
+    fn help_dialog(&mut self, ctx: &egui::Context, pal: Palette) {
         let first_run = !self.config.seen_guide;
-        if !first_run && !self.help_open {
-            return;
+        if first_run && self.help.is_none() {
+            self.help = Some(HelpTab::Start);
         }
-        let response = egui::Modal::new(egui::Id::new("guide"))
-            .frame(card(pal).inner_margin(Margin::same(28)).corner_radius(CornerRadius::same(18)))
+        let Some(mut tab) = self.help else { return };
+        let response = egui::Modal::new(egui::Id::new("help"))
+            .frame(
+                card(pal)
+                    .inner_margin(Margin::same(28))
+                    .corner_radius(CornerRadius::same(18)),
+            )
             .show(ctx, |ui| {
-                ui.set_width(460.0);
-                ui.label(RichText::new(icon::SQUARES_FOUR).size(30.0).color(ACCENT));
-                ui.add_space(6.0);
-                let title = if first_run { "Welcome to QuadKey" } else { "How QuadKey works" };
-                ui.label(RichText::new(title).font(medium(22.0)).color(pal.text));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Give every button on your dock the action you want, in three steps.").size(14.0).color(pal.dim),
-                );
-                ui.add_space(18.0);
-                for (n, title, text) in [
-                    ("1", "Pick a button", "Click one of the four tiles. Pressing the button on the dock lights it up, so you always know which one it is."),
-                    ("2", "Choose an action", "Browse Media, Screen, Windows, Meetings and Editing - or go to Custom to record your own shortcut, open an app or run a command."),
-                    ("3", "Click Apply", "QuadKey makes the dock use your choices. Remove rule gives the factory behaviour back."),
-                ] {
-                    ui.horizontal_top(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 14.0, pal.accent_tint);
-                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, n, medium(14.0), ACCENT);
-                        ui.add_space(6.0);
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(title).font(medium(15.0)).color(pal.text));
-                            ui.label(RichText::new(text).size(13.0).color(pal.dim));
-                        });
+                ui.set_width(560.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon::SQUARES_FOUR).size(26.0).color(ACCENT));
+                    let title = if first_run {
+                        "Welcome to QuadKey"
+                    } else {
+                        "QuadKey help"
+                    };
+                    ui.label(RichText::new(title).font(medium(22.0)).color(pal.text));
+                });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    for (t, name) in [
+                        (HelpTab::Start, "Getting started"),
+                        (HelpTab::Controls, "Every control explained"),
+                        (HelpTab::Questions, "Questions"),
+                    ] {
+                        if ui.add(pill_button(name, pal, tab == t)).clicked() {
+                            tab = t;
+                        }
+                    }
+                });
+                ui.add_space(16.0);
+                egui::ScrollArea::vertical()
+                    .max_height(430.0)
+                    .show(ui, |ui| match tab {
+                        HelpTab::Start => help_start(ui, pal),
+                        HelpTab::Controls => help_controls(ui, pal),
+                        HelpTab::Questions => help_questions(ui, pal),
                     });
-                    ui.add_space(12.0);
-                }
-                ui.add_space(4.0);
-                ui.label(RichText::new("Good to know").font(medium(14.0)).color(pal.text));
-                ui.add_space(4.0);
-                for line in [
-                    "\"Shortcuts for\" in the top bar chooses macOS or Linux shortcuts for the quick picks.",
-                    "On macOS QuadKey uses Karabiner-Elements; on Linux it uses keyd.",
-                    "The knob (volume and mute) keeps working as before.",
-                    "Learn from dock re-assigns a tile if your buttons send something else.",
-                ] {
-                    ui.label(RichText::new(format!("•  {line}")).size(13.0).color(pal.dim));
-                }
-                ui.add_space(20.0);
+                ui.add_space(18.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let text = if first_run { "Get started" } else { "Close" };
-                    let close = egui::Button::new(RichText::new(text).font(medium(15.0)).color(Color32::WHITE))
-                        .fill(ACCENT)
-                        .corner_radius(CornerRadius::same(18))
-                        .min_size(Vec2::new(130.0, 38.0));
+                    let close = egui::Button::new(
+                        RichText::new(text).font(medium(15.0)).color(Color32::WHITE),
+                    )
+                    .fill(ACCENT)
+                    .corner_radius(CornerRadius::same(18))
+                    .min_size(Vec2::new(130.0, 38.0));
                     ui.add(close).clicked()
                 })
                 .inner
             });
+        self.help = Some(tab);
         if response.inner || response.should_close() {
-            self.help_open = false;
+            self.help = None;
             if first_run {
                 self.config.seen_guide = true;
                 self.persist();
             }
         }
+    }
+}
+
+fn applied_path(env: &Environment) -> PathBuf {
+    env.config_file.with_file_name("applied.json")
+}
+
+fn help_heading(ui: &mut egui::Ui, pal: Palette, glyph: &str, title: &str, text: &str) {
+    ui.horizontal_top(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+        ui.painter()
+            .circle_filled(rect.center(), 15.0, pal.accent_tint);
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            glyph,
+            FontId::proportional(16.0),
+            ACCENT,
+        );
+        ui.add_space(6.0);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(title).font(medium(15.0)).color(pal.text));
+            ui.label(RichText::new(text).size(13.0).color(pal.dim));
+        });
+    });
+    ui.add_space(12.0);
+}
+
+fn help_start(ui: &mut egui::Ui, pal: Palette) {
+    ui.label(
+        RichText::new("Give every button and the knob on your dock the action you want.")
+            .size(14.0)
+            .color(pal.dim),
+    );
+    ui.add_space(14.0);
+    help_heading(
+        ui,
+        pal,
+        "1",
+        "Pick a control",
+        "Click one of the four button tiles or one of the three knob tiles (turn left, press, turn right). Using the dock lights up the matching tile, so you always know which is which.",
+    );
+    help_heading(
+        ui,
+        pal,
+        "2",
+        "Choose what it does",
+        "Browse Media, Screen, Windows, Meetings and Editing, or open Custom to record your own shortcut, open an app, run a command or switch between two actions.",
+    );
+    help_heading(
+        ui,
+        pal,
+        "3",
+        "Click Apply",
+        "Nothing changes on the dock until you click Apply, so a stray click is harmless. Tiles with a yellow dot have changes that are not applied yet; Discard throws them away.",
+    );
+    ui.label(RichText::new("The status in the top bar tells you if anything is missing, for example that the dock is not connected.").size(13.0).color(pal.dim));
+}
+
+fn help_controls(ui: &mut egui::Ui, pal: Palette) {
+    for (glyph, title, text) in [
+        (
+            icon::SQUARES_FOUR,
+            "Button and knob tiles",
+            "Each tile is one control on the dock. Click it to change it. The tile lights up whenever you use that control; a yellow dot means a change waits for Apply.",
+        ),
+        (
+            icon::INFO,
+            "Out of the box it sends",
+            "What the dock sends when nothing is changed - for example Ctrl+Cmd+Q, which locks a Mac.",
+        ),
+        (
+            icon::MAGNIFYING_GLASS,
+            "Learn from dock",
+            "Only needed if a control does not light up its tile (for example after reprogramming the dock with another app). Click it, then use the control on the dock.",
+        ),
+        (
+            icon::CHECK_CIRCLE,
+            "Does now / Will do after Apply",
+            "What the selected control does, or will do once you click Apply.",
+        ),
+        (
+            icon::ARROW_COUNTER_CLOCKWISE,
+            "Back to factory",
+            "Gives just this control its out-of-the-box behaviour back (after Apply).",
+        ),
+        (
+            icon::MUSIC_NOTES,
+            "Categories and cards",
+            "Ready-made actions. Click a card to choose it; the chosen one is highlighted.",
+        ),
+        (
+            icon::RECORD,
+            "Record shortcut",
+            "Click, then type a key combination on your keyboard. Esc cancels.",
+        ),
+        (
+            icon::KEYBOARD,
+            "Choose keys",
+            "Build a shortcut by hand: toggle Ctrl, Option/Alt, Shift, Cmd/Super and pick a key.",
+        ),
+        (
+            icon::APP_WINDOW,
+            "Open application / Run command",
+            "Starts an app or runs a shell command you write. These run on the computer, so they need QuadKey (Linux) or Karabiner-Elements (macOS).",
+        ),
+        (
+            icon::TOGGLE_LEFT,
+            "Toggle between two",
+            "The first press does one action, the next press the other - for example mute and unmute.",
+        ),
+        (
+            icon::PROHIBIT,
+            "Do nothing",
+            "Turns the control off, for buttons you keep pressing by accident.",
+        ),
+        (
+            icon::CHECK,
+            "Apply",
+            "Makes the dock use your choices. Greyed out when there is nothing to apply.",
+        ),
+        (
+            icon::X,
+            "Discard",
+            "Throws away changes that are not applied yet.",
+        ),
+        (
+            icon::CIRCLE,
+            "Status in the top bar",
+            "Ready means the dock does what you see. Otherwise it says what is missing; hover it for details.",
+        ),
+        (
+            icon::DOTS_THREE,
+            "More (⋯)",
+            "Choose whether shortcuts are for macOS or Linux, show the activity log, or reset everything to factory.",
+        ),
+        (
+            icon::LIST_BULLETS,
+            "Activity",
+            "A live list of what the dock sent and what QuadKey did, to check that a control works.",
+        ),
+    ] {
+        help_heading(ui, pal, glyph, title, text);
+    }
+}
+
+fn help_questions(ui: &mut egui::Ui, pal: Palette) {
+    for (q, a) in [
+        (
+            "How do I know my change works?",
+            "Click Apply, use the control on the dock and watch its tile light up. Under More (⋯) → Show activity you see exactly what happened.",
+        ),
+        (
+            "Is my setup saved?",
+            "Yes. Everything you choose is saved right away and survives restarts; Apply decides what the dock actually does.",
+        ),
+        (
+            "Why does macOS need Karabiner-Elements?",
+            "macOS does not let ordinary apps take over a keyboard (a protection against keyloggers). Karabiner-Elements has the system driver that can, and QuadKey sets it up for you - limited to this dock, your keyboard is never affected.",
+        ),
+        (
+            "Why does a control still do the old thing?",
+            "Check the status in the top bar - it names what is missing (Apply, Karabiner-Elements or Input Monitoring).",
+        ),
+        (
+            "Does the knob still change the volume?",
+            "Yes, until you choose something else for it.",
+        ),
+        (
+            "Does it work on Linux?",
+            "Yes, with keyd. Choose \"Shortcuts are for: Linux\" under More (⋯) if you mostly use the dock on Linux.",
+        ),
+        (
+            "How do I undo everything?",
+            "More (⋯) → Reset everything to factory. The dock behaves exactly as out of the box.",
+        ),
+        (
+            "Is this an official TobenONE app?",
+            "No. QuadKey is an independent open-source project.",
+        ),
+    ] {
+        ui.label(RichText::new(q).font(medium(14.0)).color(pal.text));
+        ui.label(RichText::new(a).size(13.0).color(pal.dim));
+        ui.add_space(12.0);
     }
 }
 
@@ -1115,6 +1649,15 @@ fn card(pal: Palette) -> Frame {
         })
 }
 
+fn section(ui: &mut egui::Ui, pal: Palette, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    card(pal).inner_margin(Margin::same(14)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(title).size(12.0).color(pal.dim));
+        ui.add_space(6.0);
+        add(ui);
+    });
+}
+
 /// A rounded pill button; `active` uses the accent color.
 fn pill_button(text: &str, pal: Palette, active: bool) -> egui::Button<'static> {
     let (fill, fg, stroke) = if active {
@@ -1196,7 +1739,7 @@ fn option_card(
     response
 }
 
-fn status_pill(ui: &mut egui::Ui, pal: Palette, color: Color32, text: &str) {
+fn status_pill(ui: &mut egui::Ui, pal: Palette, color: Color32, text: &str) -> egui::Response {
     Frame::new()
         .fill(pal.card)
         .stroke(Stroke::new(1.0, pal.border))
@@ -1219,12 +1762,61 @@ fn status_pill(ui: &mut egui::Ui, pal: Palette, color: Color32, text: &str) {
                     dot(ui);
                 }
             });
-        });
+        })
+        .response
 }
 
-/// The category tab to open for a button: where its action lives, or Custom.
+/// The category tab to open for a control: where its action lives, or Custom.
 fn tab_for(button: &Button, os: TargetOs) -> Category {
     preset_for_action(&button.action, os).map_or(Category::Custom, |p| p.category)
+}
+
+/// Human name of an action: the catalog name when it is one, otherwise a summary.
+pub fn action_name(action: &Action, os: TargetOs) -> String {
+    if let Some(preset) = preset_for_action(action, os) {
+        return preset.name.to_string();
+    }
+    match action {
+        Action::Original => "Factory setting".into(),
+        Action::Disabled => "Nothing".into(),
+        Action::OpenApp { app } if app.is_empty() => {
+            "Open an application (choose one below)".into()
+        }
+        Action::Command { command } if command.is_empty() => {
+            "Run a command (write it below)".into()
+        }
+        Action::Toggle { first, second } => {
+            format!("{} / {}", action_name(first, os), action_name(second, os))
+        }
+        other => other.summary(),
+    }
+}
+
+/// Icon for a control: for the factory setting, the icon of what the dock sends by itself.
+fn icon_for(button: &Button) -> &'static str {
+    use crate::model::{MOD_LCTRL, MOD_LGUI, MOD_LSHIFT, Trigger};
+    if button.action != Action::Original {
+        return action_icon(&button.action);
+    }
+    match button.trigger {
+        Trigger::Consumer { usage: 0x00B5 } => icon::SKIP_FORWARD,
+        Trigger::Consumer { usage: 0x00B6 } => icon::SKIP_BACK,
+        Trigger::Consumer { usage: 0x00CD } => icon::PLAY_PAUSE,
+        Trigger::Consumer { usage: 0x00E2 } => icon::SPEAKER_SLASH,
+        Trigger::Consumer { usage: 0x00E9 } => icon::SPEAKER_HIGH,
+        Trigger::Consumer { usage: 0x00EA } => icon::SPEAKER_LOW,
+        Trigger::Key { mods, key: 0x14 }
+            if Trigger::normalized_mods(mods) == MOD_LCTRL | MOD_LGUI =>
+        {
+            icon::LOCK
+        }
+        Trigger::Key { mods, key: 0x21 }
+            if Trigger::normalized_mods(mods) == MOD_LSHIFT | MOD_LGUI =>
+        {
+            icon::CROP
+        }
+        _ => icon::ARROW_COUNTER_CLOCKWISE,
+    }
 }
 
 fn action_icon(action: &Action) -> &'static str {
@@ -1235,6 +1827,7 @@ fn action_icon(action: &Action) -> &'static str {
         Action::Shortcut { .. } => icon::KEYBOARD,
         Action::OpenApp { .. } => icon::APP_WINDOW,
         Action::Command { .. } => icon::TERMINAL,
+        Action::Toggle { .. } => icon::TOGGLE_LEFT,
     }
 }
 
@@ -1248,6 +1841,7 @@ fn tile_title(button: &Button, preset_name: Option<&str>) -> String {
             .trigger
             .meaning()
             .map_or_else(|| button.trigger.label(), str::to_string),
+        Action::Toggle { .. } => "Toggle".into(),
         _ => button.action.summary(),
     }
 }
@@ -1271,7 +1865,7 @@ fn choose_app(result: Arc<Mutex<Option<String>>>) {
         let output = std::process::Command::new("osascript")
             .args([
                 "-e",
-                "POSIX path of (choose application with prompt \"Choose an app for this button\")",
+                "POSIX path of (choose application with prompt \"Choose an app for this control\")",
             ])
             .output();
         if let Ok(output) = output {
@@ -1319,5 +1913,27 @@ mod tests {
         };
         assert_eq!(tab_for(&button, TargetOs::Mac), Category::Screen);
         assert_eq!(tab_for(&button, TargetOs::Linux), Category::Custom);
+    }
+
+    #[test]
+    fn action_names_are_human() {
+        assert_eq!(
+            action_name(&Action::Original, TargetOs::Mac),
+            "Factory setting"
+        );
+        assert_eq!(
+            action_name(
+                &Action::Media {
+                    key: Media::PlayPause
+                },
+                TargetOs::Mac
+            ),
+            "Play / Pause"
+        );
+        let toggle = Action::Toggle {
+            first: Box::new(Action::Media { key: Media::Mute }),
+            second: Box::new(Action::Disabled),
+        };
+        assert_eq!(action_name(&toggle, TargetOs::Mac), "Mute sound / Nothing");
     }
 }

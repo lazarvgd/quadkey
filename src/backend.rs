@@ -137,36 +137,60 @@ fn karabiner_action(action: &Action, trigger: &Trigger) -> Option<Value> {
             json!({ "shell_command": format!("open -a {}", shell_quote(app)) })
         }
         Action::Command { command } => json!({ "shell_command": command }),
+        // Toggles become two manipulators in `karabiner_rule`; here only the first half is used
+        Action::Toggle { first, .. } => return karabiner_action(first, trigger),
     })
+}
+
+fn toggle_variable(index: usize) -> String {
+    format!("quadkey_toggle_{}", index + 1)
 }
 
 /// The complex-modification rule for the dock.
 pub fn karabiner_rule(config: &Config) -> Value {
-    let manipulators: Vec<Value> = config
-        .buttons
-        .iter()
-        .enumerate()
-        .filter_map(|(i, button)| {
-            let from = karabiner_from(&button.trigger)?;
-            let mut to = Vec::new();
-            if let Some(event) = karabiner_action(&button.action, &button.trigger) {
-                to.push(event);
+    let device =
+        json!({ "type": "device_if", "identifiers": [{ "vendor_id": VID, "product_id": PID }] });
+    let mut manipulators = Vec::new();
+    for (i, button) in config.buttons.iter().enumerate() {
+        let Some(from) = karabiner_from(&button.trigger) else {
+            continue;
+        };
+        // Tell QuadKey which control was pressed (Karabiner hides the raw reports from it)
+        let notify = json!({
+            "shell_command": format!("/usr/bin/printf {} | /usr/bin/nc -u -w0 127.0.0.1 {NOTIFY_PORT}", i + 1)
+        });
+        let manipulator = |to: Vec<Value>, extra: Option<Value>| {
+            let mut conditions = vec![device.clone()];
+            conditions.extend(extra);
+            json!({ "type": "basic", "from": from.clone(), "to": to, "conditions": conditions })
+        };
+        match &button.action {
+            Action::Toggle { first, second } => {
+                // A variable remembers which half comes next; the first match wins in Karabiner
+                let var = toggle_variable(i);
+                for (action, when, next) in
+                    [(first, "variable_unless", 1), (second, "variable_if", 0)]
+                {
+                    let mut to: Vec<Value> = karabiner_action(action, &button.trigger)
+                        .into_iter()
+                        .collect();
+                    to.push(json!({ "set_variable": { "name": var, "value": next } }));
+                    to.push(notify.clone());
+                    manipulators.push(manipulator(
+                        to,
+                        Some(json!({ "type": when, "name": var, "value": 1 })),
+                    ));
+                }
             }
-            // Tell QuadKey which button was pressed (Karabiner hides the raw reports from it)
-            to.push(json!({
-                "shell_command": format!("/usr/bin/printf {} | /usr/bin/nc -u -w0 127.0.0.1 {NOTIFY_PORT}", i + 1)
-            }));
-            Some(json!({
-                "type": "basic",
-                "from": from,
-                "to": to,
-                "conditions": [{
-                    "type": "device_if",
-                    "identifiers": [{ "vendor_id": VID, "product_id": PID }]
-                }]
-            }))
-        })
-        .collect();
+            action => {
+                let mut to: Vec<Value> = karabiner_action(action, &button.trigger)
+                    .into_iter()
+                    .collect();
+                to.push(notify);
+                manipulators.push(manipulator(to, None));
+            }
+        }
+    }
     json!({ "description": RULE_DESCRIPTION, "manipulators": manipulators })
 }
 
@@ -238,18 +262,64 @@ impl Environment {
         if cfg!(target_os = "linux") {
             #[cfg(target_os = "linux")]
             keyd_apply(config)?;
-            return Ok(format!("Saved to {KEYD_PATH} and reloaded keyd"));
+            return Ok("Applied".into());
         }
         if !self.karabiner_installed {
             bail!("Karabiner-Elements is not installed");
         }
         write_karabiner(&self.karabiner_json, Some(karabiner_rule(config)))?;
-        Ok("Applied - Karabiner-Elements picked up the new rule".into())
+        Ok("Applied".into())
     }
 
     pub fn remove(&self) -> Result<String> {
+        if cfg!(target_os = "linux") {
+            let ok = std::process::Command::new("pkexec")
+                .args(["sh", "-c", &format!("rm -f {KEYD_PATH} && keyd reload")])
+                .status()
+                .is_ok_and(|s| s.success());
+            if !ok {
+                bail!("removing {KEYD_PATH} failed");
+            }
+            return Ok("Factory behaviour restored".into());
+        }
         write_karabiner(&self.karabiner_json, None)?;
-        Ok("Dock rule removed - the dock behaves like before".into())
+        Ok("Factory behaviour restored".into())
+    }
+
+    /// True when the saved settings differ from what is active in Karabiner / keyd.
+    /// A configuration that only keeps the factory behaviour has nothing to apply.
+    pub fn needs_apply(&self, config: &Config) -> bool {
+        if config.buttons.iter().all(|b| b.action == Action::Original) {
+            // Nothing to activate - only something to remove if an older setup is still active
+            return if cfg!(target_os = "linux") {
+                std::path::Path::new(KEYD_PATH).exists()
+            } else {
+                self.rule_active()
+            };
+        }
+        if cfg!(target_os = "linux") {
+            return std::fs::read_to_string(KEYD_PATH).ok().as_deref()
+                != Some(keyd_config(config).as_str());
+        }
+        let active = std::fs::read_to_string(&self.karabiner_json)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|root| {
+                root.get("profiles")?
+                    .as_array()?
+                    .iter()
+                    .find_map(|profile| {
+                        profile["complex_modifications"]["rules"]
+                            .as_array()?
+                            .iter()
+                            .find(|r| {
+                                r.get("description").and_then(Value::as_str)
+                                    == Some(RULE_DESCRIPTION)
+                            })
+                            .cloned()
+                    })
+            });
+        active.as_ref() != Some(&karabiner_rule(config))
     }
 
     pub fn rule_active(&self) -> bool {
@@ -305,6 +375,8 @@ fn keyd_consumer(usage: u16) -> Option<&'static str> {
 fn keyd_action(action: &Action) -> Option<String> {
     Some(match action {
         Action::Original => return None,
+        // Toggles are written by `keyd_config` (they need a layer per control)
+        Action::Toggle { .. } => return None,
         // Programs are started by QuadKey in the user session - keyd only swallows the key
         Action::Disabled | Action::OpenApp { .. } | Action::Command { .. } => "noop".into(),
         Action::Media { key } => keyd_consumer(media_consumer_usage(*key))?.into(),
@@ -327,22 +399,54 @@ fn keyd_action(action: &Action) -> Option<String> {
     })
 }
 
+/// keyd name of the key or media key a trigger sends.
+fn keyd_trigger_name(trigger: &Trigger) -> Option<String> {
+    match *trigger {
+        Trigger::Consumer { usage } => keyd_consumer(usage).map(str::to_string),
+        Trigger::Key { key, .. } => keyd_key(key),
+    }
+}
+
+/// Body of a keyd macro for one half of a toggle.
+fn keyd_macro(action: &Action, trigger: &Trigger) -> String {
+    let action = match action {
+        Action::Original => return keyd_trigger_name(trigger).unwrap_or_else(|| "noop".into()),
+        other => keyd_action(other).unwrap_or_else(|| "noop".into()),
+    };
+    action
+        .strip_prefix("macro(")
+        .and_then(|a| a.strip_suffix(')'))
+        .map(str::to_string)
+        .unwrap_or(action)
+}
+
 /// keyd configuration for the dock only.
 pub fn keyd_config(config: &Config) -> String {
+    let mut sections: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let mut main = Vec::new();
-    let mut layers: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-    for button in &config.buttons {
-        let Some(action) = keyd_action(&button.action) else {
+    for (i, button) in config.buttons.iter().enumerate() {
+        let Some(name) = keyd_trigger_name(&button.trigger) else {
             continue;
         };
-        match button.trigger {
-            Trigger::Consumer { usage } => {
-                if let Some(name) = keyd_consumer(usage) {
-                    main.push(format!("{name} = {action}"));
-                }
+        let action = match &button.action {
+            // togglem(layer, macro) runs the macro and flips the layer; the layer holds the second half
+            Action::Toggle { first, second } => {
+                let layer = format!("qk{}", i + 1);
+                let second = format!(
+                    "{name} = togglem({layer}, {})",
+                    keyd_macro(second, &button.trigger)
+                );
+                sections.entry(layer.clone()).or_default().push(second);
+                format!("togglem({layer}, {})", keyd_macro(first, &button.trigger))
             }
-            Trigger::Key { mods, key } => {
-                let Some(name) = keyd_key(key) else { continue };
+            other => match keyd_action(other) {
+                Some(action) => action,
+                None => continue,
+            },
+        };
+        let line = format!("{name} = {action}");
+        match button.trigger {
+            Trigger::Key { mods, .. } if Trigger::normalized_mods(mods) != 0 => {
                 let m = Trigger::normalized_mods(mods);
                 let layer: Vec<&str> = [
                     (MOD_LCTRL, "control"),
@@ -354,15 +458,9 @@ pub fn keyd_config(config: &Config) -> String {
                 .filter(|(bit, _)| m & bit != 0)
                 .map(|(_, n)| *n)
                 .collect();
-                if layer.is_empty() {
-                    main.push(format!("{name} = {action}"));
-                } else {
-                    layers
-                        .entry(layer.join("+"))
-                        .or_default()
-                        .push(format!("{name} = {action}"));
-                }
+                sections.entry(layer.join("+")).or_default().push(line);
             }
+            _ => main.push(line),
         }
     }
     let mut out = format!(
@@ -372,8 +470,8 @@ pub fn keyd_config(config: &Config) -> String {
         out.push_str(&line);
         out.push('\n');
     }
-    for (layer, lines) in layers {
-        out.push_str(&format!("\n[{layer}]\n"));
+    for (section, lines) in sections {
+        out.push_str(&format!("\n[{section}]\n"));
         for line in lines {
             out.push_str(&line);
             out.push('\n');
@@ -402,10 +500,27 @@ pub fn keyd_apply(config: &Config) -> Result<()> {
 }
 
 /// Linux: run the program actions ourselves (keyd swallows the key).
-pub fn run_local_action(action: &Action) {
+pub fn run_local_action(index: usize, action: &Action) {
+    // Which half of each toggle runs next (keyd keeps its own state for key actions)
+    static NEXT_IS_SECOND: std::sync::Mutex<[bool; crate::model::CONTROLS]> =
+        std::sync::Mutex::new([false; crate::model::CONTROLS]);
+    let action = match action {
+        Action::Toggle { first, second } => {
+            let Ok(mut state) = NEXT_IS_SECOND.lock() else {
+                return;
+            };
+            let Some(second_next) = state.get_mut(index) else {
+                return;
+            };
+            let half = if *second_next { second } else { first };
+            *second_next = !*second_next;
+            half.as_ref().clone()
+        }
+        other => other.clone(),
+    };
     let command = match action {
-        Action::OpenApp { app } if cfg!(target_os = "linux") => app.clone(),
-        Action::Command { command } if cfg!(target_os = "linux") => command.clone(),
+        Action::OpenApp { app } if cfg!(target_os = "linux") => app,
+        Action::Command { command } if cfg!(target_os = "linux") => command,
         _ => return,
     };
     let _ = std::process::Command::new("sh")
@@ -431,7 +546,7 @@ mod tests {
     fn karabiner_rule_is_device_specific() {
         let rule = karabiner_rule(&config());
         let m = rule["manipulators"].as_array().unwrap();
-        assert_eq!(m.len(), 4);
+        assert_eq!(m.len(), 7); // four buttons and the knob
         for manipulator in m {
             assert_eq!(
                 manipulator["conditions"][0]["identifiers"][0]["vendor_id"],

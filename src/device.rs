@@ -180,7 +180,7 @@ fn udp_loop(tx: Sender<DockEvent>, repaint: impl Fn()) {
         if let Some(index) = std::str::from_utf8(&buf[..n])
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
-            && (1..=4).contains(&index)
+            && (1..=crate::model::CONTROLS).contains(&index)
         {
             let _ = tx.send(DockEvent::PressedButton(index - 1));
             repaint();

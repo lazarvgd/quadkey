@@ -234,6 +234,11 @@ pub enum Action {
     Command {
         command: String,
     },
+    /// Alternates between two actions: first press does `first`, the next one `second`.
+    Toggle {
+        first: Box<Action>,
+        second: Box<Action>,
+    },
 }
 
 impl Action {
@@ -245,6 +250,16 @@ impl Action {
             Action::Shortcut { .. } => "Keyboard shortcut",
             Action::OpenApp { .. } => "Open application",
             Action::Command { .. } => "Run command",
+            Action::Toggle { .. } => "Toggle between two",
+        }
+    }
+
+    /// Actions the dock can be told to do on its own (keys); the rest needs the computer.
+    pub fn needs_computer(&self) -> bool {
+        match self {
+            Action::OpenApp { .. } | Action::Command { .. } => true,
+            Action::Toggle { first, second } => first.needs_computer() || second.needs_computer(),
+            _ => false,
         }
     }
 
@@ -302,8 +317,21 @@ impl Action {
                 format!("Open {name}")
             }
             Action::Command { command } => format!("$ {command}"),
+            Action::Toggle { first, second } => {
+                format!("{} / {}", first.summary(), second.summary())
+            }
         }
     }
+}
+
+/// Number of controls: four buttons and the knob (turn left, turn right, press).
+pub const CONTROLS: usize = 7;
+pub const KNOB_LEFT: usize = 4;
+pub const KNOB_RIGHT: usize = 5;
+pub const KNOB_PRESS: usize = 6;
+
+pub fn is_knob(index: usize) -> bool {
+    index >= KNOB_LEFT
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -381,6 +409,10 @@ impl Default for Config {
                         key: 0x21,
                     },
                 ),
+                // The knob sends ordinary media keys, captured on 2026-10-15
+                button("Knob left", Trigger::Consumer { usage: 0x00EA }),
+                button("Knob right", Trigger::Consumer { usage: 0x00E9 }),
+                button("Knob press", Trigger::Consumer { usage: 0x00E2 }),
             ],
             target_os: TargetOs::current(),
             seen_guide: false,
@@ -400,7 +432,15 @@ impl Config {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Config>(&text).ok())
-            .filter(|c| c.buttons.len() == 4)
+            .map(|mut c| {
+                // Settings saved before the knob was configurable: add its controls
+                if c.buttons.len() == 4 {
+                    c.buttons
+                        .extend(Config::default().buttons.into_iter().skip(4));
+                }
+                c
+            })
+            .filter(|c| c.buttons.len() == CONTROLS)
             .unwrap_or_default()
     }
 
@@ -462,6 +502,56 @@ mod tests {
             .ends_with("+4")
         );
         assert_eq!(key_label(0x14), "Q");
+    }
+
+    #[test]
+    fn knob_controls_and_migration() {
+        let c = Config::default();
+        assert_eq!(c.buttons.len(), CONTROLS);
+        assert_eq!(
+            c.button_for(&Trigger::Consumer { usage: 0xE9 }),
+            Some(KNOB_RIGHT)
+        );
+        assert_eq!(
+            c.button_for(&Trigger::Consumer { usage: 0xEA }),
+            Some(KNOB_LEFT)
+        );
+        // An old four-button file gains the knob and keeps its buttons
+        let dir = std::env::temp_dir().join(format!("quadkey-migrate-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let mut old = Config::default();
+        old.buttons.truncate(4);
+        old.buttons[0].action = Action::Disabled;
+        old.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded.buttons.len(), CONTROLS);
+        assert_eq!(loaded.buttons[0].action, Action::Disabled);
+        assert_eq!(
+            loaded.buttons[KNOB_PRESS].trigger,
+            Trigger::Consumer { usage: 0xE2 }
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn toggle_summary_and_roundtrip() {
+        let toggle = Action::Toggle {
+            first: Box::new(Action::Media {
+                key: Media::PlayPause,
+            }),
+            second: Box::new(Action::Disabled),
+        };
+        assert_eq!(toggle.summary(), "Play / Pause / Disabled");
+        assert!(!toggle.needs_computer());
+        let json = serde_json::to_string(&toggle).unwrap();
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), toggle);
+        let with_command = Action::Toggle {
+            first: Box::new(Action::Command {
+                command: "true".into(),
+            }),
+            second: Box::new(Action::Disabled),
+        };
+        assert!(with_command.needs_computer());
     }
 
     #[test]
@@ -553,6 +643,19 @@ fn keys(ctrl: bool, alt: bool, shift: bool, cmd: bool, key: &str) -> Option<Acti
 fn media(key: Media) -> Option<Action> {
     Some(Action::Media { key })
 }
+
+fn cmd(command: &str) -> Option<Action> {
+    Some(Action::Command {
+        command: command.into(),
+    })
+}
+
+/// Mutes the input by setting its volume to 0 and remembers the old level for unmuting.
+pub const MAC_MIC_TOGGLE: &str = r#"f="$HOME/.quadkey-mic"; v=$(osascript -e 'input volume of (get volume settings)'); if [ "$v" -gt 0 ]; then echo "$v" > "$f"; osascript -e 'set volume input volume 0' -e 'display notification "Microphone muted" with title "QuadKey"'; else osascript -e "set volume input volume $(cat "$f" 2>/dev/null || echo 75)" -e 'display notification "Microphone on" with title "QuadKey"'; fi"#;
+pub const LINUX_MIC_TOGGLE: &str =
+    "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle || pactl set-source-mute @DEFAULT_SOURCE@ toggle";
+pub const MAC_DARK_TOGGLE: &str = r#"osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to not dark mode'"#;
+pub const LINUX_DARK_TOGGLE: &str = r#"k=org.gnome.desktop.interface; if [ "$(gsettings get $k color-scheme)" = "'prefer-dark'" ]; then gsettings set $k color-scheme default; else gsettings set $k color-scheme prefer-dark; fi"#;
 
 /// Everything offered as a one-click choice, grouped by category.
 pub fn catalog() -> Vec<Preset> {
@@ -777,6 +880,22 @@ pub fn catalog() -> Vec<Preset> {
             keys(true, false, false, false, "e"),
         ),
         p(
+            C::Meetings,
+            "Mute microphone (all apps)",
+            "Toggle the system microphone, press again to unmute",
+            i::MICROPHONE_SLASH,
+            cmd(MAC_MIC_TOGGLE),
+            cmd(LINUX_MIC_TOGGLE),
+        ),
+        p(
+            C::Screen,
+            "Dark mode on/off",
+            "Switch between light and dark appearance",
+            i::MOON,
+            cmd(MAC_DARK_TOGGLE),
+            cmd(LINUX_DARK_TOGGLE),
+        ),
+        p(
             C::Editing,
             "Copy",
             "Copy the selection",
@@ -927,6 +1046,22 @@ mod preset_tests {
                     "{os:?}: empty {cat:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn toggle_commands_are_valid_shell() {
+        for command in [
+            MAC_MIC_TOGGLE,
+            LINUX_MIC_TOGGLE,
+            MAC_DARK_TOGGLE,
+            LINUX_DARK_TOGGLE,
+        ] {
+            let status = std::process::Command::new("sh")
+                .args(["-n", "-c", command])
+                .status()
+                .unwrap();
+            assert!(status.success(), "invalid shell: {command}");
         }
     }
 

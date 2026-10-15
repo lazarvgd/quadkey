@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build universal binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create -output quadkey target/aarch64-apple-darwin/release/quadkey target/x86_64-apple-darwin/release/quadkey
+      - name: Bundle QuadKey.app
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP=QuadKey.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp quadkey "$APP/Contents/MacOS/quadkey"
+          sed "s/VERSION/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+          cp packaging/macos/QuadKey.icns "$APP/Contents/Resources/QuadKey.icns"
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --keepParent "$APP" QuadKey-macos.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: QuadKey-macos.zip
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Package
+        run: |
+          mkdir -p quadkey-linux-x86_64
+          cp target/release/quadkey README.md LICENSE linux/70-quadkey.rules quadkey-linux-x86_64/
+          tar czf quadkey-linux-x86_64.tar.gz quadkey-linux-x86_64
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: quadkey-linux-x86_64.tar.gz
