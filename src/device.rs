@@ -73,6 +73,11 @@ fn open_dock(api: &mut HidApi) -> (Vec<Interface>, bool) {
             (page, _) if page >= 0xFF00 => Kind::Vendor,
             _ => Kind::Other,
         };
+        // The vendor channel is left to dockcfg, which writes the configuration and must get
+        // the dock's answers itself
+        if kind == Kind::Vendor {
+            continue;
+        }
         if let Ok(device) = info.open_device(api) {
             let _ = device.set_blocking_mode(false);
             keyboard_ok |= kind == Kind::Keyboard;

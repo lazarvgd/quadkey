@@ -1,6 +1,6 @@
 [package]
 name = "quadkey"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Configure the buttons of the TobenONE UDS060 USB dock on macOS and Linux"
 license = "PolyForm-Noncommercial-1.0.0"

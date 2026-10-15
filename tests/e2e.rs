@@ -2,6 +2,7 @@
 //! into the app's channel) and temporary files instead of the real Karabiner configuration.
 
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{Key, Modifiers, Vec2};
 use egui_kittest::Harness;
@@ -9,6 +10,7 @@ use egui_kittest::kittest::Queryable;
 use quadkey::app::{Connection, DockStudio, Readiness, style};
 use quadkey::backend::{Environment, RULE_DESCRIPTION};
 use quadkey::device::DockEvent;
+use quadkey::dockcfg::DockLink;
 use quadkey::model::{
     Action, Category, Config, KNOB_PRESS, MOD_LCTRL, MOD_LGUI, Media, TargetOs, Trigger,
 };
@@ -19,6 +21,21 @@ struct Fixture {
     _dir: TempDir,
     env: Environment,
     dock: Sender<DockEvent>,
+    /// Plain configuration messages QuadKey sent to the (fake) dock.
+    written: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+/// A dock that confirms every configuration message.
+struct FakeDock(Arc<Mutex<Vec<Vec<u8>>>>);
+
+impl DockLink for FakeDock {
+    fn exchange(&mut self, message: &[u8]) -> anyhow::Result<[u8; 64]> {
+        self.0.lock().unwrap().push(message.to_vec());
+        let mut answer = [0u8; 64];
+        answer[..message.len()].copy_from_slice(message);
+        answer[3] += 0x10;
+        Ok(answer)
+    }
 }
 
 fn fixture_with(karabiner_installed: bool, seen_guide: bool) -> (Fixture, DockStudio) {
@@ -42,12 +59,16 @@ fn fixture_with(karabiner_installed: bool, seen_guide: bool) -> (Fixture, DockSt
     };
     config.save_to(&env.config_file).unwrap();
     let (tx, rx) = DockStudio::channel();
-    let app = DockStudio::new(env.clone(), rx);
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let link = written.clone();
+    let app = DockStudio::new(env.clone(), rx)
+        .with_dock_link(move || Ok(Box::new(FakeDock(link.clone())) as Box<dyn DockLink>));
     (
         Fixture {
             _dir: dir,
             env,
             dock: tx,
+            written,
         },
         app,
     )
@@ -420,6 +441,60 @@ fn back_to_factory_for_one_control() {
 }
 
 #[test]
+fn shortcuts_and_media_are_written_into_the_dock_without_karabiner() {
+    let (fx, app) = fixture(false);
+    let mut h = harness(app);
+    connect(&fx);
+    h.run_steps(4);
+    h.get_by_label("Dock button 3").click();
+    h.run_steps(4);
+    h.state_mut().config.buttons[2].action = Action::Shortcut {
+        ctrl: true,
+        alt: false,
+        shift: true,
+        cmd: false,
+        key: "f".into(),
+    };
+    h.state_mut().config.buttons[0].action = Action::Media {
+        key: Media::PlayPause,
+    };
+    h.run_steps(4);
+    assert_eq!(
+        h.state().readiness(),
+        Readiness::NeedsApply,
+        "no Karabiner needed"
+    );
+    h.get_by_label("Apply").click();
+    h.run_steps(4);
+    let toast = h.state().toast.clone().unwrap();
+    assert!(
+        toast.ok && toast.text.starts_with("Saved in the dock"),
+        "{}",
+        toast.text
+    );
+    let written = fx.written.lock().unwrap().clone();
+    assert!(
+        written.contains(&vec![0x01, 0x06, 0x10, 0x04, 0x00, 0x01, 0x07]),
+        "{written:x?}"
+    );
+    assert!(
+        written
+            .iter()
+            .any(|m| m[..7] == [0x01, 0x06, 0x50, 0x00, 0x02, 0x01, 0x03])
+    );
+    // QuadKey now recognises the new shortcut as button 3
+    assert_eq!(
+        h.state().config.buttons[2].trigger,
+        Trigger::Key {
+            mods: MOD_LCTRL | quadkey::model::MOD_LSHIFT,
+            key: 0x09
+        }
+    );
+    assert!(!h.state().can_apply());
+    assert!(dock_rule(&fx.env).is_none(), "nothing goes to Karabiner");
+}
+
+#[test]
 fn karabiner_missing_is_explained() {
     if !cfg!(target_os = "macos") {
         return;
@@ -428,16 +503,20 @@ fn karabiner_missing_is_explained() {
     let mut h = harness(app);
     connect(&fx);
     h.run_steps(4);
-    h.get_by_label(&tab(Category::Media)).click();
+    h.get_by_label(&tab(Category::Custom)).click();
     h.run_steps(4);
-    h.get_by_label("Play / Pause").click();
+    h.get_by_label("Do nothing").click();
     h.run_steps(4);
     assert_eq!(h.state().readiness(), Readiness::NeedsKarabiner);
     h.get_by_label("Install Karabiner-Elements");
     h.get_by_label("Apply").click();
     h.run_steps(4);
     let toast = h.state().toast.clone().unwrap();
-    assert!(!toast.ok && toast.text.contains("Install Karabiner-Elements"));
+    assert!(
+        !toast.ok && toast.text.contains("Karabiner-Elements"),
+        "{}",
+        toast.text
+    );
     assert!(dock_rule(&fx.env).is_none());
 }
 
@@ -638,9 +717,7 @@ fn stopped_karabiner_is_explained() {
         seen_guide: true,
         ..Config::default()
     };
-    config.buttons[0].action = Action::Media {
-        key: Media::PlayPause,
-    };
+    config.buttons[0].action = Action::Disabled;
     config.save_to(&env.config_file).unwrap();
     let (tx, rx) = DockStudio::channel();
     let mut h = harness(DockStudio::new(env, rx));

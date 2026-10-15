@@ -17,6 +17,7 @@ use egui_phosphor::regular as icon;
 
 use crate::backend::{self, Environment};
 use crate::device::DockEvent;
+use crate::dockcfg;
 use crate::model::{
     Action, Button, CONTROLS, Category, Config, DEVICE_NAME, KNOB_LEFT, KNOB_PRESS, KNOB_RIGHT,
     Media, TargetOs, is_knob, key_name_from_egui, preset_for_action, presets_for, shortcut_keys,
@@ -153,6 +154,7 @@ pub struct DockStudio {
     karabiner_running: bool,
     karabiner_checked_at: f64,
     vendor_packets: usize,
+    dock_link: Box<dyn Fn() -> anyhow::Result<Box<dyn dockcfg::DockLink>>>,
     now: f64,
 }
 
@@ -185,8 +187,20 @@ impl DockStudio {
             karabiner_running: true,
             karabiner_checked_at: f64::NEG_INFINITY,
             vendor_packets: 0,
+            dock_link: Box::new(|| {
+                Ok(Box::new(dockcfg::HidDock::open()?) as Box<dyn dockcfg::DockLink>)
+            }),
             now: 0.0,
         }
+    }
+
+    /// Talk to a different dock (tests use a fake one).
+    pub fn with_dock_link(
+        mut self,
+        link: impl Fn() -> anyhow::Result<Box<dyn dockcfg::DockLink>> + 'static,
+    ) -> Self {
+        self.dock_link = Box::new(link);
+        self
     }
 
     /// For tests and the real app alike: an event channel the HID threads write into.
@@ -205,9 +219,11 @@ impl DockStudio {
             .collect()
     }
 
-    /// True when Apply would change something in Karabiner / keyd and every choice is complete.
+    /// True when Apply would change something (in the dock or in Karabiner / keyd) and every
+    /// choice is complete.
     pub fn can_apply(&self) -> bool {
-        self.incomplete().is_none() && self.env.needs_apply(&self.config)
+        self.incomplete().is_none()
+            && (!self.changed_controls().is_empty() || self.env.needs_apply(&self.host_config()))
     }
 
     /// A choice that cannot work yet, e.g. "Open application" without an application.
@@ -227,23 +243,38 @@ impl DockStudio {
         })
     }
 
+    /// Controls whose action the dock cannot do by itself (open an app, run a command, toggle,
+    /// do nothing) - those need Karabiner-Elements or keyd on the computer.
+    pub fn computer_controls(&self) -> Vec<usize> {
+        (0..CONTROLS)
+            .filter(|&i| dockcfg::dock_setting(i, &self.config.buttons[i].action).is_none())
+            .collect()
+    }
+
+    /// The settings for Karabiner / keyd: everything stored in the dock passes through unchanged.
+    fn host_config(&self) -> Config {
+        let mut host = self.config.clone();
+        for (i, button) in host.buttons.iter_mut().enumerate() {
+            if dockcfg::dock_setting(i, &button.action).is_some() {
+                button.action = Action::Original;
+            }
+        }
+        host
+    }
+
     /// Whether the dock already does what the settings say.
     pub fn readiness(&self) -> Readiness {
-        let customized = self
-            .config
-            .buttons
-            .iter()
-            .any(|b| b.action != Action::Original);
+        let needs_computer = !self.computer_controls().is_empty();
         match &self.connection {
             Connection::Disconnected => return Readiness::DockMissing,
             Connection::Waiting => return Readiness::LookingForDock,
             Connection::Connected { keyboard_ok: false } => return Readiness::NeedsInputMonitoring,
             Connection::Connected { keyboard_ok: true } => {}
         }
-        if cfg!(target_os = "macos") && customized && !self.env.karabiner_installed {
+        if cfg!(target_os = "macos") && needs_computer && !self.env.karabiner_installed {
             return Readiness::NeedsKarabiner;
         }
-        if cfg!(target_os = "macos") && customized && !self.karabiner_running {
+        if cfg!(target_os = "macos") && needs_computer && !self.karabiner_running {
             return Readiness::KarabinerStopped;
         }
         if self.can_apply() {
@@ -294,51 +325,121 @@ impl DockStudio {
         self.persist();
     }
 
-    /// Make the dock follow the draft.
+    /// Store in the dock what it can do by itself; hand the rest to Karabiner / keyd.
     pub fn apply(&mut self) {
-        if cfg!(target_os = "macos") && !self.env.karabiner_installed {
-            self.show_toast(
-                false,
-                "Install Karabiner-Elements first - your choices are saved".into(),
-            );
-            return;
-        }
-        let changes: Vec<String> = self
-            .changed_controls()
-            .into_iter()
-            .map(|i| {
-                format!(
-                    "{} → {}",
-                    Self::control_name(i),
-                    action_name(&self.config.buttons[i].action, self.config.target_os)
-                )
+        self.apply_controls(self.changed_controls());
+    }
+
+    fn apply_controls(&mut self, to_write: Vec<usize>) {
+        let os = self.config.target_os;
+        let describe = |s: &Self, i: usize| {
+            format!(
+                "{} → {}",
+                Self::control_name(i),
+                action_name(&s.config.buttons[i].action, os)
+            )
+        };
+
+        // 1. The dock: shortcuts and media keys are stored in the dock itself
+        let writes: Vec<(usize, dockcfg::DockSetting)> = to_write
+            .iter()
+            .filter_map(|&i| {
+                dockcfg::dock_setting(i, &self.config.buttons[i].action).map(|s| (i, s))
             })
             .collect();
-        let all_factory = self
-            .config
-            .buttons
-            .iter()
-            .all(|b| b.action == Action::Original);
-        let result = if all_factory {
-            self.env.remove()
-        } else {
-            self.env.apply(&self.config)
-        };
-        match result {
-            Ok(_) => {
-                self.applied = self.config.clone();
-                if let Err(err) = self.applied.save_to(&applied_path(&self.env)) {
-                    self.show_toast(false, format!("Applied, but could not remember it: {err}"));
+        let mut stored = Vec::new();
+        if !writes.is_empty() {
+            let mut link = match (self.dock_link)() {
+                Ok(link) => link,
+                Err(err) => {
+                    self.show_toast(false, format!("Could not reach the dock: {err}"));
                     return;
                 }
-                let text = if changes.is_empty() {
-                    "Applied - press a control on the dock to try it".to_string()
-                } else {
-                    format!("Applied: {}", changes.join(", "))
-                };
-                self.show_toast(true, text);
+            };
+            for (i, setting) in writes {
+                if let Err(err) =
+                    dockcfg::write(link.as_mut(), dockcfg::SLOT_OF_CONTROL[i], &setting)
+                {
+                    self.show_toast(
+                        false,
+                        format!(
+                            "Could not write {} to the dock: {err}",
+                            Self::control_name(i)
+                        ),
+                    );
+                    return;
+                }
+                // The dock now sends something else for this control - recognise it by that
+                if let Some(trigger) = dockcfg::trigger_for(i, &setting) {
+                    self.config.buttons[i].trigger = trigger;
+                }
+                self.applied.buttons[i] = self.config.buttons[i].clone();
+                stored.push(describe(self, i));
             }
-            Err(err) => self.show_toast(false, format!("Could not apply: {err}")),
+            self.persist();
+        }
+
+        // 2. The computer: apps, commands, toggles and "do nothing"
+        let host = self.host_config();
+        let computer: Vec<usize> = to_write
+            .iter()
+            .copied()
+            .filter(|i| self.computer_controls().contains(i))
+            .collect();
+        let mut host_error = None;
+        if self.env.needs_apply(&host) {
+            let all_factory = host.buttons.iter().all(|b| b.action == Action::Original);
+            let result = if all_factory {
+                self.env.remove()
+            } else if cfg!(target_os = "macos") && !self.env.karabiner_installed {
+                Err(anyhow::anyhow!(
+                    "opening apps and running commands needs Karabiner-Elements"
+                ))
+            } else {
+                self.env.apply(&host)
+            };
+            if let Err(err) = result {
+                host_error = Some(err.to_string());
+            }
+        }
+        if host_error.is_none() {
+            for &i in &computer {
+                self.applied.buttons[i] = self.config.buttons[i].clone();
+            }
+        }
+        if let Err(err) = self.applied.save_to(&applied_path(&self.env)) {
+            self.show_toast(false, format!("Applied, but could not remember it: {err}"));
+            return;
+        }
+
+        let mut parts = Vec::new();
+        if !stored.is_empty() {
+            parts.push(format!("Saved in the dock: {}", stored.join(", ")));
+        }
+        let computer_done: Vec<String> = if host_error.is_none() {
+            computer.iter().map(|&i| describe(self, i)).collect()
+        } else {
+            Vec::new()
+        };
+        if !computer_done.is_empty() {
+            parts.push(format!(
+                "Applied on this computer: {}",
+                computer_done.join(", ")
+            ));
+        }
+        match host_error {
+            Some(err) => {
+                let mut text = parts.join(". ");
+                if !text.is_empty() {
+                    text.push_str(". ");
+                }
+                text.push_str(&format!("Not applied: {err}"));
+                self.show_toast(false, text);
+            }
+            None if parts.is_empty() => {
+                self.show_toast(true, "Applied - use the dock to try it".into())
+            }
+            None => self.show_toast(true, parts.join(". ")),
         }
     }
 
@@ -352,17 +453,18 @@ impl DockStudio {
         self.show_toast(true, "Changes discarded".into());
     }
 
-    /// Every control back to factory behaviour, and QuadKey's rule removed.
+    /// Every control back to factory behaviour - written to the dock even if QuadKey thinks it
+    /// already is, because another app may have reprogrammed it.
     pub fn reset_everything(&mut self) {
         let keep = (self.config.target_os, self.config.seen_guide);
         self.config = Config::default();
         (self.config.target_os, self.config.seen_guide) = keep;
         self.persist();
         self.tab = tab_for(&self.config.buttons[self.selected], self.config.target_os);
-        if self.can_apply() {
-            self.apply();
+        self.apply_controls((0..CONTROLS).collect());
+        if self.toast.as_ref().is_some_and(|t| t.ok) {
+            self.show_toast(true, "Everything is back to factory behaviour".into());
         }
-        self.show_toast(true, "Everything is back to factory behaviour".into());
     }
 
     /// Drain the events coming from the HID and UDP threads.
@@ -569,7 +671,7 @@ impl DockStudio {
                     Readiness::NeedsKarabiner => (
                         pal.warn,
                         "Install Karabiner-Elements",
-                        "Your choices are saved, but macOS needs Karabiner-Elements to change what the dock does. Install it once, then click Apply.",
+                        "Shortcuts and media keys are stored in the dock itself. Opening apps, running commands, toggles and \"do nothing\" run on the computer, and on macOS that needs Karabiner-Elements. Install it once, then click Apply.",
                     ),
                     Readiness::KarabinerStopped => (
                         pal.warn,
@@ -1689,8 +1791,8 @@ fn help_questions(ui: &mut egui::Ui, pal: Palette) {
             "Yes. Everything you choose is saved right away and survives restarts; Apply decides what the dock actually does.",
         ),
         (
-            "Why does macOS need Karabiner-Elements?",
-            "macOS does not let ordinary apps take over a keyboard (a protection against keyloggers). Karabiner-Elements has the system driver that can, and QuadKey sets it up for you - limited to this dock, your keyboard is never affected.",
+            "When is Karabiner-Elements needed?",
+            "Only for actions the dock cannot do by itself: opening an app, running a command, toggling between two actions, or doing nothing. Shortcuts and media keys are written into the dock and work on any computer without extra software.",
         ),
         (
             "Why does a control still do the old thing?",

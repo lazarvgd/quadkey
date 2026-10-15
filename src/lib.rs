@@ -3,4 +3,5 @@
 pub mod app;
 pub mod backend;
 pub mod device;
+pub mod dockcfg;
 pub mod model;

@@ -55,7 +55,7 @@ Ready-made actions use the right shortcuts for the system you choose — for exa
 
 ### macOS
 
-1. **Install [Karabiner-Elements](https://karabiner-elements.pqrs.org/)** (free, open source) and finish its setup: it asks you to allow its driver and *Input Monitoring* in System Settings. QuadKey uses it to take over the dock — see [why](#why-does-macos-need-karabiner-elements).
+1. **Optional: install [Karabiner-Elements](https://karabiner-elements.pqrs.org/)** (free, open source). Shortcuts and media keys are written into the dock itself and need nothing else. Karabiner-Elements is only needed for *Open application*, *Run command*, *Toggle between two* and *Do nothing* — see [when](#when-is-karabiner-elements-needed).
 2. **Install QuadKey:**
    - download `QuadKey-macos.zip` from the [latest release](https://github.com/lazarvgd/quadkey/releases/latest), unzip it and move **QuadKey.app** to *Applications*. The app is not signed with an Apple Developer certificate, so the first time **right-click it and choose Open**;
    - or build it yourself: `cargo install --git https://github.com/lazarvgd/quadkey` and run `quadkey`.
@@ -114,26 +114,30 @@ The window follows your system's light or dark appearance.
 
 ## How it works
 
-The dock does not need a driver: it presents itself to the computer as an ordinary keyboard, mouse and media-key device. Its factory configuration lives inside the dock and decides what each control sends. QuadKey does not change that configuration. Instead it asks your operating system's input remapper to translate what the dock sends — **for this device only**, matched by its USB IDs, so your real keyboard is never affected:
+The dock does not need a driver: it presents itself to the computer as an ordinary keyboard, mouse and media-key device. Its configuration lives inside the dock and decides what each control sends.
+
+**Shortcuts and media keys are written into the dock.** When you click Apply, QuadKey sends them over the dock's configuration channel. The dock keeps them when unplugged and they work on any computer, with nothing installed.
+
+**Everything else runs on the computer.** The dock cannot open an app, run a command, alternate between two actions or stay silent. For those, QuadKey asks your operating system's input remapper to translate what the dock sends — **for this device only**, matched by its USB IDs, so your real keyboard is never affected:
 
 | | Remapper | What QuadKey writes when you click Apply |
 |---|---|---|
 | macOS | [Karabiner-Elements](https://karabiner-elements.pqrs.org/) | one rule in `~/.config/karabiner/karabiner.json`, limited to vendor `0xFFF1` / product `0x00C2`. Your other Karabiner rules are kept, and a backup of the file is made next to it. |
 | Linux | [keyd](https://github.com/rvaiya/keyd) | `/etc/keyd/quadkey.conf` with `[ids] fff1:00c2`, then `keyd reload` (through `pkexec`). |
 
-Because the remapper takes over the dock, the factory shortcuts (lock screen, screenshot) no longer reach the system once you apply.
+For those controls the remapper takes over, so the factory shortcuts (lock screen, screenshot) no longer reach the system once you apply.
 
 QuadKey's own settings are stored in `config.json` (your draft) and `applied.json` (what is active) in the standard configuration folder: `~/Library/Application Support/quadkey/` on macOS and `~/.config/quadkey/` on Linux.
 
 ## Frequently asked questions
 
-### Why does macOS need Karabiner-Elements?
+### When is Karabiner-Elements needed?
 
-macOS does not let ordinary apps take over a keyboard — it is a protection against keyloggers. Only software with a special system driver can do that, and Karabiner-Elements is the well-known, open-source tool that has one. QuadKey sets it up for you.
+Only for actions the dock cannot do by itself: *Open application*, *Run command*, *Toggle between two* and *Do nothing*. macOS does not let ordinary apps take over a keyboard — it is a protection against keyloggers — and Karabiner-Elements is the well-known, open-source tool with the system driver that can. QuadKey sets it up for you. Shortcuts and media keys are written into the dock and need nothing.
 
-### Can QuadKey write the settings into the dock itself, so nothing is needed on the computer?
+### Does the dock keep my settings when I plug it into another computer?
 
-Not yet. The dock stores its configuration internally and can be reprogrammed over an encrypted vendor channel; the protocol is being worked out. When that lands, the keyboard-based actions will be stored in the dock and work on any computer without Karabiner-Elements or keyd.
+Shortcuts and media keys, yes — they are stored in the dock. Actions that run on the computer only work where QuadKey's rule is installed.
 
 ### A control still does the old thing.
 
@@ -164,7 +168,9 @@ Toggles on Linux use keyd's `togglem`; they are covered by tests but have not be
 | 0 | mouse |
 | 1 | boot keyboard — the button shortcuts |
 | 2 | consumer control (media keys, used by the knob), system control, touch digitizer |
-| 3 | vendor channel: usage page `0xFFFE`, 64-byte reports, TEA-encrypted; used by the vendor's configuration software |
+| 3 | configuration channel: usage page `0xFFFE`, 64-byte reports, TEA-encrypted (see `src/dockcfg.rs`) |
+
+Each control is a slot in the dock. A slot holds either one of the dock's built-in functions (media keys and a few factory shortcuts) or a combination of up to four keys. QuadKey reads and writes these slots; the dock confirms every write.
 
 ## Development
 
@@ -181,6 +187,7 @@ The end-to-end tests drive the real user interface — they click tiles, choose 
 |---|---|
 | `model.rs` | controls, triggers, actions, the catalog of ready-made actions, saved settings |
 | `device.rs` | background reader for the dock's HID interfaces, plus press notifications from Karabiner |
+| `dockcfg.rs` | the dock's configuration protocol: encryption, messages, writing a control |
 | `backend.rs` | generating the Karabiner rule and the keyd configuration, applying and removing them |
 | `app.rs` | the user interface |
 
