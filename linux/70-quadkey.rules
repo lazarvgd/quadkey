@@ -1,0 +1,2 @@
+# Let the logged-in user read the TobenONE UDS060 dock without root (hidraw access for QuadKey)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="fff1", ATTRS{idProduct}=="00c2", MODE="0660", TAG+="uaccess"

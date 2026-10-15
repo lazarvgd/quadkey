@@ -1,0 +1,22 @@
+[package]
+name = "quadkey"
+version = "0.1.0"
+edition = "2024"
+description = "Configure the buttons of the TobenONE UDS060 USB dock on macOS and Linux"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/lazarvgd/quadkey"
+readme = "README.md"
+keywords = ["hid", "dock", "macro-keys", "karabiner", "keyd"]
+categories = ["gui", "hardware-support"]
+
+[dependencies]
+anyhow = "1.0.104"
+dirs = "7.0.0"
+eframe = "0.36.2"
+hidapi = "2.6.7"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36.2", features = ["wgpu", "snapshot"] }
+tempfile = "3.27.0"
