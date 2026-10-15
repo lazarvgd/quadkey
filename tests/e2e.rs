@@ -25,6 +25,7 @@ fn fixture_with(karabiner_installed: bool, seen_guide: bool) -> (Fixture, DockSt
     let dir = tempfile::tempdir().unwrap();
     let env = Environment {
         karabiner_installed,
+        karabiner_running: Some(true),
         karabiner_json: dir.path().join("karabiner/karabiner.json"),
         config_file: dir.path().join("quadkey/config.json"),
     };
@@ -574,4 +575,81 @@ fn welcome_guide_on_first_start_and_help_later() {
     h.get_by_label("Close").click();
     h.run_steps(4);
     assert!(h.query_by_label("QuadKey help").is_none());
+}
+
+#[test]
+fn open_application_needs_an_app_before_apply() {
+    let (fx, app) = fixture(true);
+    let mut h = harness(app);
+    connect(&fx);
+    h.run_steps(4);
+    h.get_by_label("Dock button 3").click();
+    h.run_steps(4);
+    h.get_by_label(&tab(Category::Custom)).click();
+    h.run_steps(4);
+    h.get_by_label("Open application").click();
+    h.run_steps(4);
+    assert!(
+        !h.state().can_apply(),
+        "an empty application must not be applied"
+    );
+    h.get_by_label("Button 3: choose an application first");
+    h.get_by_label("No application chosen yet");
+
+    // Typing the application makes it complete
+    h.get_by_label("Application");
+    h.state_mut().config.buttons[2].action = Action::OpenApp {
+        app: "/Applications/Calculator.app".into(),
+    };
+    h.run_steps(4);
+    h.get_by_label_contains("Opens Calculator");
+    if cfg!(target_os = "macos") {
+        assert!(h.state().can_apply());
+        h.get_by_label("Apply").click();
+        h.run_steps(4);
+        let rule = dock_rule(&fx.env).unwrap();
+        let m = rule["manipulators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["from"]["key_code"] == "q")
+            .unwrap();
+        assert_eq!(
+            m["to"][0]["shell_command"],
+            "open -a '/Applications/Calculator.app'"
+        );
+    }
+}
+
+#[test]
+fn stopped_karabiner_is_explained() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let env = Environment {
+        karabiner_installed: true,
+        karabiner_running: Some(false),
+        karabiner_json: dir.path().join("karabiner.json"),
+        config_file: dir.path().join("config.json"),
+    };
+    let mut config = Config {
+        target_os: TargetOs::Mac,
+        seen_guide: true,
+        ..Config::default()
+    };
+    config.buttons[0].action = Action::Media {
+        key: Media::PlayPause,
+    };
+    config.save_to(&env.config_file).unwrap();
+    let (tx, rx) = DockStudio::channel();
+    let mut h = harness(DockStudio::new(env, rx));
+    tx.send(DockEvent::Connected {
+        interfaces: 4,
+        keyboard_ok: true,
+    })
+    .unwrap();
+    h.run_steps(4);
+    assert_eq!(h.state().readiness(), Readiness::KarabinerStopped);
+    h.get_by_label("Start Karabiner-Elements");
 }

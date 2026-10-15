@@ -20,12 +20,24 @@ pub const RULE_DESCRIPTION: &str = "QuadKey - USB dock fff1:00c2 (managed automa
 // ---------------------------------------------------------------- Karabiner
 
 pub fn karabiner_installed() -> bool {
+    // Only the app counts - support folders stay behind after Karabiner-Elements is removed
+    std::path::Path::new("/Applications/Karabiner-Elements.app").exists()
+}
+
+/// Whether Karabiner-Elements' background service is running (it may be installed but stopped).
+pub fn karabiner_running() -> bool {
     [
-        "/Applications/Karabiner-Elements.app",
-        "/Library/Application Support/org.pqrs/Karabiner-Elements",
+        "Karabiner-Core-Service",
+        "karabiner_grabber",
+        "karabiner_console_user_server",
     ]
     .iter()
-    .any(|p| std::path::Path::new(p).exists())
+    .any(|name| {
+        std::process::Command::new("pgrep")
+            .args(["-x", name])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
 }
 
 pub fn karabiner_config_path() -> PathBuf {
@@ -245,6 +257,8 @@ fn write_karabiner(path: &Path, rule: Option<Value>) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct Environment {
     pub karabiner_installed: bool,
+    /// `None` checks the running processes; tests pin it.
+    pub karabiner_running: Option<bool>,
     pub karabiner_json: PathBuf,
     pub config_file: PathBuf,
 }
@@ -253,6 +267,7 @@ impl Environment {
     pub fn system() -> Self {
         Environment {
             karabiner_installed: karabiner_installed(),
+            karabiner_running: None,
             karabiner_json: karabiner_config_path(),
             config_file: Config::path(),
         }
@@ -320,6 +335,10 @@ impl Environment {
                     })
             });
         active.as_ref() != Some(&karabiner_rule(config))
+    }
+
+    pub fn is_karabiner_running(&self) -> bool {
+        self.karabiner_running.unwrap_or_else(karabiner_running)
     }
 
     pub fn rule_active(&self) -> bool {

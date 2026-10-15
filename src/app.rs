@@ -6,8 +6,8 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Margin,
@@ -118,6 +118,7 @@ pub enum Readiness {
     LookingForDock,
     NeedsInputMonitoring,
     NeedsKarabiner,
+    KarabinerStopped,
     NeedsApply,
 }
 
@@ -149,7 +150,8 @@ pub struct DockStudio {
     lit_at: [Option<f64>; CONTROLS],
     env: Environment,
     events: Receiver<DockEvent>,
-    picked_app: Arc<Mutex<Option<String>>>,
+    karabiner_running: bool,
+    karabiner_checked_at: f64,
     vendor_packets: usize,
     now: f64,
 }
@@ -180,7 +182,8 @@ impl DockStudio {
             lit_at: [None; CONTROLS],
             env,
             events,
-            picked_app: Arc::new(Mutex::new(None)),
+            karabiner_running: true,
+            karabiner_checked_at: f64::NEG_INFINITY,
             vendor_packets: 0,
             now: 0.0,
         }
@@ -202,9 +205,26 @@ impl DockStudio {
             .collect()
     }
 
-    /// True when Apply would change something in Karabiner / keyd.
+    /// True when Apply would change something in Karabiner / keyd and every choice is complete.
     pub fn can_apply(&self) -> bool {
-        self.env.needs_apply(&self.config)
+        self.incomplete().is_none() && self.env.needs_apply(&self.config)
+    }
+
+    /// A choice that cannot work yet, e.g. "Open application" without an application.
+    pub fn incomplete(&self) -> Option<String> {
+        fn missing(action: &Action) -> Option<&'static str> {
+            match action {
+                Action::OpenApp { app } if app.trim().is_empty() => Some("choose an application"),
+                Action::Command { command } if command.trim().is_empty() => {
+                    Some("write the command")
+                }
+                Action::Toggle { first, second } => missing(first).or_else(|| missing(second)),
+                _ => None,
+            }
+        }
+        self.config.buttons.iter().enumerate().find_map(|(i, b)| {
+            missing(&b.action).map(|what| format!("{}: {what} first", Self::control_name(i)))
+        })
     }
 
     /// Whether the dock already does what the settings say.
@@ -222,6 +242,9 @@ impl DockStudio {
         }
         if cfg!(target_os = "macos") && customized && !self.env.karabiner_installed {
             return Readiness::NeedsKarabiner;
+        }
+        if cfg!(target_os = "macos") && customized && !self.karabiner_running {
+            return Readiness::KarabinerStopped;
         }
         if self.can_apply() {
             return Readiness::NeedsApply;
@@ -395,9 +418,6 @@ impl DockStudio {
                 DockEvent::Vendor(_) => self.vendor_packets += 1,
             }
         }
-        if let Some(app) = self.picked_app.lock().ok().and_then(|mut p| p.take()) {
-            self.assign(Action::OpenApp { app });
-        }
     }
 
     /// What really happened for a press, for the activity log.
@@ -471,6 +491,10 @@ impl DockStudio {
         }
         let now = ui.input(|i| i.time);
         self.now = now;
+        if now - self.karabiner_checked_at > 3.0 {
+            self.karabiner_checked_at = now;
+            self.karabiner_running = self.env.is_karabiner_running();
+        }
         self.process_events(now);
         self.record_shortcut(ui);
         if self.lit_at.iter().flatten().any(|t| now - t < GLOW_SECONDS) {
@@ -546,6 +570,11 @@ impl DockStudio {
                         pal.warn,
                         "Install Karabiner-Elements",
                         "Your choices are saved, but macOS needs Karabiner-Elements to change what the dock does. Install it once, then click Apply.",
+                    ),
+                    Readiness::KarabinerStopped => (
+                        pal.warn,
+                        "Start Karabiner-Elements",
+                        "Karabiner-Elements is installed but not running. Open it once (Applications → Karabiner-Elements) and allow what it asks for.",
                     ),
                     Readiness::NeedsApply => (pal.warn, "Changes not applied", "Click Apply at the bottom to make the dock use your choices."),
                 };
@@ -632,7 +661,7 @@ impl DockStudio {
                 ui.label(RichText::new("Knob").font(medium(14.0)).color(pal.text));
                 ui.horizontal(|ui| {
                     for index in [KNOB_LEFT, KNOB_PRESS, KNOB_RIGHT] {
-                        self.tile(ui, pal, index, now);
+                        self.knob_part(ui, pal, index, now);
                     }
                 });
                 ui.add_space(2.0);
@@ -646,6 +675,112 @@ impl DockStudio {
                 );
             });
         });
+    }
+
+    /// One part of the knob: turning left or right (arrow tiles) or pressing it (a round knob).
+    fn knob_part(&mut self, ui: &mut egui::Ui, pal: Palette, index: usize, now: f64) {
+        let size = Vec2::new(104.0, 132.0);
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let label = format!("Knob: {}", POSITIONS[index].to_lowercase());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+        let response = response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(match index {
+                KNOB_LEFT => "What turning the knob to the left (counter-clockwise) does",
+                KNOB_RIGHT => "What turning the knob to the right (clockwise) does",
+                _ => "What pressing the knob down does",
+            });
+
+        let button = &self.config.buttons[index];
+        let changed = button != &self.applied.buttons[index];
+        let preset = preset_for_action(&button.action, self.config.target_os);
+        let glow = self.lit_at[index].map_or(0.0, |t| {
+            (1.0 - ((now - t) / GLOW_SECONDS)).clamp(0.0, 1.0) as f32
+        });
+        let selected = self.selected == index;
+        let active = selected || glow > 0.0;
+        let base = if response.hovered() {
+            pal.card_hover
+        } else {
+            pal.card
+        };
+        let tint: f32 = if selected { 0.6 } else { 0.0 };
+        let fill = lerp(base, pal.accent_tint, tint.max(glow));
+        let stroke = if self.learning == Some(index) {
+            Stroke::new(2.0, pal.warn)
+        } else if active {
+            Stroke::new(2.0, ACCENT)
+        } else {
+            Stroke::new(1.0, pal.border)
+        };
+        let painter = ui.painter();
+        let shadow = egui::epaint::Shadow {
+            offset: [0, 2],
+            blur: 8,
+            spread: 0,
+            color: pal.shadow,
+        };
+        let graphic = egui::Rect::from_center_size(
+            rect.center_top() + Vec2::new(0.0, 40.0),
+            Vec2::splat(76.0),
+        );
+        if index == KNOB_PRESS {
+            // The knob itself: a round cap with a ring, pressed in when lit
+            let radius = 36.0 - glow * 2.0;
+            painter.add(shadow.as_shape(graphic, CornerRadius::same(38)));
+            painter.circle(graphic.center(), radius, fill, stroke);
+            painter.circle_stroke(graphic.center(), radius - 7.0, Stroke::new(1.0, pal.border));
+            painter.text(
+                graphic.center(),
+                Align2::CENTER_CENTER,
+                icon::HAND_TAP,
+                FontId::proportional(22.0),
+                if active { ACCENT } else { pal.dim },
+            );
+        } else {
+            let radius = CornerRadius::same(16);
+            painter.add(shadow.as_shape(graphic, radius));
+            painter.rect_filled(graphic, radius, fill);
+            painter.rect_stroke(graphic, radius, stroke, StrokeKind::Inside);
+            let arrow = if index == KNOB_LEFT {
+                icon::ARROW_COUNTER_CLOCKWISE
+            } else {
+                icon::ARROW_CLOCKWISE
+            };
+            painter.text(
+                graphic.center(),
+                Align2::CENTER_CENTER,
+                arrow,
+                FontId::proportional(34.0),
+                if active { ACCENT } else { pal.dim },
+            );
+        }
+        if changed {
+            painter.circle_filled(graphic.right_top() + Vec2::new(-6.0, 6.0), 4.0, pal.warn);
+        }
+        let caption = match index {
+            KNOB_LEFT => "Turn left",
+            KNOB_RIGHT => "Turn right",
+            _ => "Press",
+        };
+        painter.text(
+            rect.center_top() + Vec2::new(0.0, 92.0),
+            Align2::CENTER_TOP,
+            caption,
+            medium(13.0),
+            pal.text,
+        );
+        let title = tile_title(button, preset.as_ref().map(|p| p.name));
+        painter.text(
+            rect.center_top() + Vec2::new(0.0, 112.0),
+            Align2::CENTER_TOP,
+            truncate(&title, 15),
+            FontId::proportional(11.5),
+            if changed { pal.warn } else { pal.dim },
+        );
+        if response.clicked() {
+            self.select(index);
+        }
     }
 
     fn tile(&mut self, ui: &mut egui::Ui, pal: Palette, index: usize, now: f64) {
@@ -1064,7 +1199,7 @@ impl DockStudio {
 
     fn custom_details(&mut self, ui: &mut egui::Ui, pal: Palette, index: usize) {
         let mut changed = false;
-        let picked = self.picked_app.clone();
+        let mut pick_app = false;
         let os = self.config.target_os;
         let target_mac = os == TargetOs::Mac;
         match &mut self.config.buttons[index].action {
@@ -1119,9 +1254,22 @@ impl DockStudio {
                         if cfg!(target_os = "macos")
                             && ui.add(pill_button("Choose...", pal, false)).clicked()
                         {
-                            choose_app(picked);
+                            pick_app = true;
                         }
                     });
+                    let opens = if app.trim().is_empty() {
+                        RichText::new("No application chosen yet")
+                            .size(12.0)
+                            .color(pal.warn)
+                    } else {
+                        let name = std::path::Path::new(app.as_str())
+                            .file_stem()
+                            .map_or_else(|| app.clone(), |s| s.to_string_lossy().to_string());
+                        RichText::new(format!("{}  Opens {name}", icon::CHECK))
+                            .size(12.0)
+                            .color(pal.ok)
+                    };
+                    ui.label(opens);
                 });
             }
             Action::Command { command } => {
@@ -1200,6 +1348,9 @@ impl DockStudio {
         if changed {
             self.persist();
         }
+        if pick_app && let Some(app) = choose_app() {
+            self.assign(Action::OpenApp { app });
+        }
     }
 
     fn footer(&mut self, ui: &mut egui::Ui, pal: Palette) {
@@ -1247,6 +1398,10 @@ impl DockStudio {
                     ui.label(RichText::new(glyph).size(18.0).color(color));
                     ui.label(RichText::new(&toast.text).size(14.0).color(pal.text));
                 }
+                None if self.incomplete().is_some() => {
+                    let text = self.incomplete().unwrap_or_default();
+                    ui.label(RichText::new(text).size(13.0).color(pal.warn));
+                }
                 None if changes > 0 => {
                     let text = if changes == 1 {
                         "1 change not applied".to_string()
@@ -1259,6 +1414,9 @@ impl DockStudio {
                     let hint = match self.readiness() {
                         Readiness::NeedsKarabiner => {
                             "Install Karabiner-Elements to make your choices work."
+                        }
+                        Readiness::KarabinerStopped => {
+                            "Start Karabiner-Elements to make your choices work."
                         }
                         _ => "All saved. Pick a control to change it.",
                     };
@@ -1859,27 +2017,20 @@ fn truncate(text: &str, max: usize) -> String {
     }
 }
 
-/// macOS application picker in a background thread (the dialog is modal).
-fn choose_app(result: Arc<Mutex<Option<String>>>) {
-    std::thread::spawn(move || {
-        let output = std::process::Command::new("osascript")
-            .args([
-                "-e",
-                "POSIX path of (choose application with prompt \"Choose an app for this control\")",
-            ])
-            .output();
-        if let Ok(output) = output {
-            let path = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .trim_end_matches('/')
-                .to_string();
-            if !path.is_empty()
-                && let Ok(mut slot) = result.lock()
-            {
-                *slot = Some(path);
-            }
-        }
-    });
+/// The system's own "open" dialog, starting in Applications (macOS).
+#[cfg(target_os = "macos")]
+fn choose_app() -> Option<String> {
+    rfd::FileDialog::new()
+        .set_title("Choose an application for this control")
+        .set_directory("/Applications")
+        .add_filter("Application", &["app"])
+        .pick_file()
+        .map(|path| path.to_string_lossy().trim_end_matches('/').to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn choose_app() -> Option<String> {
+    None
 }
 
 #[cfg(test)]

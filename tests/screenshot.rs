@@ -13,6 +13,7 @@ fn render_main_window() {
     let dir = tempfile::tempdir().unwrap();
     let env = Environment {
         karabiner_installed: true,
+        karabiner_running: Some(true),
         karabiner_json: dir.path().join("k.json"),
         config_file: dir.path().join("c.json"),
     };
