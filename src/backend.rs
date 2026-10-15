@@ -281,6 +281,7 @@ fn keyd_key(usage: u8) -> Option<String> {
             "left_arrow" => "left",
             "down_arrow" => "down",
             "up_arrow" => "up",
+            "print_screen" => "sysrq",
             other => other,
         }
         .to_string(),

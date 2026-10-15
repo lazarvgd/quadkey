@@ -18,6 +18,9 @@ fn render_main_window() {
     };
     let (tx, rx) = DockStudio::channel();
     let mut app = DockStudio::new(env, rx);
+    app.config.seen_guide = true;
+    app.config.target_os = quadkey::model::TargetOs::Mac;
+    app.tab = quadkey::model::Category::Media;
     app.config.buttons[0].action = Action::Media {
         key: Media::PlayPause,
     };
@@ -26,11 +29,16 @@ fn render_main_window() {
     };
     app.selected = 2;
     let mut h = Harness::builder()
-        .with_size(Vec2::new(900.0, 640.0))
+        .with_size(Vec2::new(1100.0, 760.0))
         .with_pixels_per_point(2.0)
         .wgpu()
         .build_ui_state(|ui, app: &mut DockStudio| app.draw(ui), app);
     style(&h.ctx);
+    if std::env::var("DARK").is_ok() {
+        h.ctx.set_theme(eframe::egui::Theme::Dark);
+    } else {
+        h.ctx.set_theme(eframe::egui::Theme::Light);
+    }
     tx.send(DockEvent::Connected {
         interfaces: 4,
         keyboard_ok: true,

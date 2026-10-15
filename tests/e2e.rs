@@ -3,13 +3,13 @@
 
 use std::sync::mpsc::Sender;
 
-use eframe::egui::Vec2;
+use eframe::egui::{Key, Modifiers, Vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use quadkey::app::{Connection, DockStudio};
+use quadkey::app::{Connection, DockStudio, style};
 use quadkey::backend::{Environment, RULE_DESCRIPTION};
 use quadkey::device::DockEvent;
-use quadkey::model::{Action, Config, MOD_LCTRL, MOD_LGUI, Trigger};
+use quadkey::model::{Action, Category, Config, MOD_LCTRL, MOD_LGUI, Media, TargetOs, Trigger};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -19,7 +19,7 @@ struct Fixture {
     dock: Sender<DockEvent>,
 }
 
-fn fixture(karabiner_installed: bool) -> (Fixture, DockStudio) {
+fn fixture_with(karabiner_installed: bool, seen_guide: bool) -> (Fixture, DockStudio) {
     let dir = tempfile::tempdir().unwrap();
     let env = Environment {
         karabiner_installed,
@@ -32,6 +32,12 @@ fn fixture(karabiner_installed: bool) -> (Fixture, DockStudio) {
         r#"{"profiles":[{"name":"Default","selected":true,"complex_modifications":{"rules":[{"description":"Mine","manipulators":[]}]}}]}"#,
     )
     .unwrap();
+    let config = Config {
+        target_os: TargetOs::Mac,
+        seen_guide,
+        ..Config::default()
+    };
+    config.save_to(&env.config_file).unwrap();
     let (tx, rx) = DockStudio::channel();
     let app = DockStudio::new(env.clone(), rx);
     (
@@ -44,10 +50,20 @@ fn fixture(karabiner_installed: bool) -> (Fixture, DockStudio) {
     )
 }
 
+fn fixture(karabiner_installed: bool) -> (Fixture, DockStudio) {
+    fixture_with(karabiner_installed, true)
+}
+
 fn harness(app: DockStudio) -> Harness<'static, DockStudio> {
-    Harness::builder()
-        .with_size(Vec2::new(900.0, 640.0))
-        .build_ui_state(|ui, app: &mut DockStudio| app.draw(ui), app)
+    let h = Harness::builder()
+        .with_size(Vec2::new(1100.0, 760.0))
+        .build_ui_state(|ui, app: &mut DockStudio| app.draw(ui), app);
+    style(&h.ctx);
+    h
+}
+
+fn tab(category: Category) -> String {
+    format!("{}  {}", category.icon(), category.label())
 }
 
 fn karabiner(env: &Environment) -> Value {
@@ -69,10 +85,15 @@ fn shows_the_cube_and_header() {
     let mut h = harness(app);
     h.run();
     h.get_by_label("QuadKey");
+    h.get_by_label("TobenONE UDS060");
     for n in 1..=4 {
-        h.get_by_label(&format!("Button {n}"));
+        h.get_by_label(&format!("Dock button {n}"));
     }
-    h.get_by_label("Button 1 · Top left");
+    h.get_by_label("Button 1");
+    h.get_by_label("Top left");
+    for category in Category::ALL {
+        h.get_by_label(&tab(category));
+    }
 }
 
 #[test]
@@ -133,26 +154,25 @@ fn select_tile_change_action_apply_and_remove() {
     let mut h = harness(app);
     h.run();
 
-    // Select the lock-screen button
-    h.get_by_label("Button 3").click();
+    h.get_by_label("Dock button 3").click();
     h.run();
-    h.get_by_label("Button 3 · Bottom left");
+    h.get_by_label("Button 3");
+    h.get_by_label("Bottom left");
     if cfg!(target_os = "macos") {
         h.get_by_label("macOS: Lock screen");
     }
 
-    // Change its action to "Do nothing" through the combo box
-    h.get_by_value("Keep original").click();
+    h.get_by_label(&tab(Category::Custom)).click();
     h.run();
     h.get_by_label("Do nothing").click();
     h.run();
     assert_eq!(h.state().config.buttons[2].action, Action::Disabled);
     assert!(h.state().dirty);
-    h.get_by_label("Unapplied changes");
-
-    // The choice is saved right away
-    let saved = Config::load_from(&fx.env.config_file);
-    assert_eq!(saved.buttons[2].action, Action::Disabled);
+    h.get_by_label_contains("Unapplied changes");
+    assert_eq!(
+        Config::load_from(&fx.env.config_file).buttons[2].action,
+        Action::Disabled
+    );
 
     if !cfg!(target_os = "macos") {
         return; // applying on Linux needs keyd and pkexec
@@ -172,7 +192,6 @@ fn select_tile_change_action_apply_and_remove() {
         .unwrap();
     assert_eq!(lock["to"][0]["key_code"], "vk_none");
     assert_eq!(lock["conditions"][0]["identifiers"][0]["vendor_id"], 0xFFF1);
-    // The user's own rule is untouched and a backup exists
     assert!(karabiner(&fx.env).to_string().contains("\"Mine\""));
     assert!(
         fx.env
@@ -189,29 +208,52 @@ fn select_tile_change_action_apply_and_remove() {
 }
 
 #[test]
-fn media_action_editor() {
+fn media_tab_assigns_in_one_click() {
     let (fx, app) = fixture(true);
     let mut h = harness(app);
     h.run();
-    h.get_by_value("Keep original").click();
+    h.get_by_label(&tab(Category::Media)).click();
     h.run();
-    h.get_by_label("Media key").click();
-    h.run();
-    // Default media key, then pick another one
-    assert!(matches!(
-        h.state().config.buttons[0].action,
-        Action::Media { .. }
-    ));
-    h.get_by_value("Play / Pause").click();
-    h.run();
-    h.get_by_label("Mute").click();
+    h.get_by_label("Mute sound").click();
     h.run();
     assert_eq!(
         Config::load_from(&fx.env.config_file).buttons[0].action,
-        Action::Media {
-            key: quadkey::model::Media::Mute
-        }
+        Action::Media { key: Media::Mute }
     );
+    // Selecting the tile again opens the tab its action lives in
+    h.get_by_label("Dock button 2").click();
+    h.run();
+    h.get_by_label("Dock button 1").click();
+    h.run();
+    assert_eq!(h.state().tab, Category::Media);
+}
+
+#[test]
+fn every_category_offers_options_to_every_button() {
+    let (_fx, app) = fixture(true);
+    let mut h = harness(app);
+    h.run();
+    for button in 1..=4 {
+        h.get_by_label(&format!("Dock button {button}")).click();
+        h.run();
+        for (category, option) in [
+            (Category::Media, "Play / Pause"),
+            (Category::Screen, "Screenshot"),
+            (Category::Windows, "Show desktop"),
+            (Category::Meetings, "Zoom: mute mic"),
+            (Category::Editing, "Copy"),
+        ] {
+            h.get_by_label(&tab(category)).click();
+            h.run();
+            h.get_by_label(option).click();
+            h.run();
+            let action = h.state().config.buttons[button - 1].action.clone();
+            assert!(
+                !matches!(action, Action::Original),
+                "{option} not assigned to button {button}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -219,7 +261,7 @@ fn learn_from_dock_replaces_trigger() {
     let (fx, app) = fixture(true);
     let mut h = harness(app);
     h.run();
-    h.get_by_label("Button 2").click();
+    h.get_by_label("Dock button 2").click();
     h.run();
     h.get_by_label("Learn from dock").click();
     h.run();
@@ -236,9 +278,8 @@ fn learn_from_dock_replaces_trigger() {
         f13
     );
 
-    // Reset brings back the factory trigger
     h.get_by_label("Reset button").click();
-    h.run();
+    h.run_steps(3);
     assert_eq!(
         h.state().config.buttons[1].trigger,
         Config::default().buttons[1].trigger
@@ -272,14 +313,15 @@ fn disconnect_is_shown() {
 }
 
 #[test]
-fn settings_survive_restart() {
+fn custom_command_survives_restart() {
     let (fx, app) = fixture(true);
     let mut h = harness(app);
     h.run();
-    h.get_by_value("Keep original").click();
+    h.get_by_label(&tab(Category::Custom)).click();
     h.run();
     h.get_by_label("Run command").click();
     h.run();
+    h.get_by_label("Shell command");
     drop(h);
 
     let (_tx, rx) = DockStudio::channel();
@@ -291,44 +333,23 @@ fn settings_survive_restart() {
 }
 
 #[test]
-fn quick_pick_assigns_action_in_one_click() {
-    let (fx, app) = fixture(true);
-    let mut h = harness(app);
-    h.run();
-    h.get_by_label("Button 4").click();
-    h.run();
-    h.get_by_label("Play / Pause").click();
-    h.run();
-    assert_eq!(
-        h.state().config.buttons[3].action,
-        Action::Media {
-            key: quadkey::model::Media::PlayPause
-        }
-    );
-    h.get_by_label("Disable button").click();
-    h.run();
-    assert_eq!(
-        Config::load_from(&fx.env.config_file).buttons[3].action,
-        Action::Disabled
-    );
-}
-
-#[test]
 fn record_shortcut_from_keyboard() {
     let (_fx, app) = fixture(true);
     let mut h = harness(app);
     h.run();
+    h.get_by_label(&tab(Category::Custom)).click();
+    h.run();
     h.get_by_label("Record shortcut").click();
     h.run();
     assert!(h.state().recording);
-    h.get_by_label("Press keys now... (Esc cancels)");
+    h.get_by_label("Press keys now...");
 
-    let mods = eframe::egui::Modifiers {
+    let mods = Modifiers {
         ctrl: true,
         shift: true,
         ..Default::default()
     };
-    h.key_press_modifiers(mods, eframe::egui::Key::K);
+    h.key_press_modifiers(mods, Key::K);
     h.run();
     assert!(!h.state().recording);
     assert_eq!(
@@ -341,6 +362,8 @@ fn record_shortcut_from_keyboard() {
             key: "k".into()
         }
     );
+    // The manual key editor is shown for the recorded shortcut
+    h.get_by_label("Keys to send");
 }
 
 #[test]
@@ -348,10 +371,60 @@ fn record_shortcut_can_be_cancelled_with_escape() {
     let (_fx, app) = fixture(true);
     let mut h = harness(app);
     h.run();
+    h.get_by_label(&tab(Category::Custom)).click();
+    h.run();
     h.get_by_label("Record shortcut").click();
     h.run();
-    h.key_press(eframe::egui::Key::Escape);
+    h.key_press(Key::Escape);
     h.run();
     assert!(!h.state().recording);
     assert_eq!(h.state().config.buttons[0].action, Action::Original);
+}
+
+#[test]
+fn shortcuts_follow_the_chosen_system() {
+    let (fx, app) = fixture(true);
+    let mut h = harness(app);
+    h.run();
+    h.get_by_label("Linux").click();
+    h.run();
+    assert_eq!(h.state().config.target_os, TargetOs::Linux);
+    h.get_by_label(&tab(Category::Screen)).click();
+    h.run();
+    h.get_by_label("Lock screen").click();
+    h.run();
+    assert_eq!(
+        Config::load_from(&fx.env.config_file).buttons[0].action,
+        Action::Shortcut {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            cmd: true,
+            key: "l".into()
+        }
+    );
+    // macOS-only picks are not offered for Linux
+    h.get_by_label(&tab(Category::Windows)).click();
+    h.run();
+    assert!(h.query_by_label("Emoji picker").is_none());
+}
+
+#[test]
+fn welcome_guide_on_first_start_only() {
+    let (fx, app) = fixture_with(true, false);
+    let mut h = harness(app);
+    h.run();
+    h.get_by_label("Welcome to QuadKey");
+    h.get_by_label("Get started").click();
+    h.run();
+    assert!(h.query_by_label("Welcome to QuadKey").is_none());
+    assert!(Config::load_from(&fx.env.config_file).seen_guide);
+
+    // Help reopens it as a reference
+    h.get_by_label_contains("Help").click();
+    h.run();
+    h.get_by_label("How QuadKey works");
+    h.get_by_label("Close").click();
+    h.run();
+    assert!(h.query_by_label("How QuadKey works").is_none());
 }

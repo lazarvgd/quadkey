@@ -2,17 +2,23 @@
 
 Configure the four buttons of the **TobenONE UDS060** USB dock on **macOS and Linux** — the vendor only ships software for Windows.
 
-![QuadKey](docs/screenshot.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+  <img alt="QuadKey" src="docs/screenshot.png">
+</picture>
 
 Out of the box the dock's buttons send *Previous track*, *Next track*, **Ctrl+Cmd+Q** (locks the Mac) and **Shift+Cmd+4** (screenshot). QuadKey lets you give each button any action you like:
 
-- **Media keys** — play/pause, next/previous, volume, mute, brightness
-- **Keyboard shortcuts** — pick one, or press **Record shortcut** and type it
-- **Open an application** or **run a shell command**
-- **Do nothing** — for buttons you keep pressing by accident
-- One-click **quick picks**: Mission Control, Spotlight, screenshot, lock screen, mute the mic in Zoom/Teams, copy/paste…
+- **Media** — play/pause, next/previous track, volume, mute, brightness
+- **Screen** — screenshot, screenshot of an area, to the clipboard, screen recording, lock screen
+- **Windows** — all windows (Mission Control / Activities), show desktop, next/previous desktop, app search, emoji picker, close window
+- **Meetings** — mute the mic or toggle the camera in Zoom, Teams and Google Meet
+- **Editing** — copy, paste, cut, undo, redo, save, find, new tab
+- **Custom** — record any shortcut by typing it, pick keys by hand, open an application, run your own shell command, do nothing, or keep the factory behaviour
 
-The cube in the window lights up when you press a button on the dock, so you always see which button is which. **Learn from dock** re-assigns a tile if your dock's buttons are configured differently.
+Every button can take every action. Quick picks use the right shortcuts for **macOS or Linux** — you choose which in the top bar, so the dock can move between computers.
+
+The cube in the window lights up when you press a button on the dock, so you always see which button is which. **Learn from dock** re-assigns a tile if your dock's buttons are configured differently. A short guide opens on first start and is always one click away under **Help**. The window follows the system's light or dark appearance.
 
 > Not affiliated with TobenONE. The dock is identified by its USB IDs (`fff1:00c2`); other docks that use the same chip may work too.
 
@@ -64,7 +70,7 @@ On Linux, *Open application* and *Run command* are executed by QuadKey itself (k
 
 ```bash
 cargo test                                   # unit tests + end-to-end UI tests (egui_kittest)
-cargo test --test screenshot -- --ignored    # render the window to /tmp/quadkey.png
+cargo test --test screenshot -- --ignored    # render the window to /tmp/quadkey.png (DARK=1 for the dark theme)
 cargo run
 ```
 
@@ -85,3 +91,5 @@ QuadKey is **free for personal, hobby, educational and other noncommercial use**
 - You may **not** use it for commercial purposes: no selling it, no bundling it into a paid product or service, and no use by a business to make money.
 
 For commercial use, please [ask](https://github.com/lazarvgd/quadkey/issues).
+
+Bundled third-party components keep their own licenses: the [Ubuntu font](https://design.ubuntu.com/font) under the [Ubuntu Font Licence](assets/fonts/UFL.txt), and [Phosphor icons](https://phosphoricons.com) (MIT) via `egui-phosphor`.

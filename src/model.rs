@@ -131,6 +131,7 @@ pub fn key_name(usage: u8) -> Option<String> {
         0x37 => "period".into(),
         0x38 => "slash".into(),
         0x3A..=0x45 => format!("f{}", usage - 0x39),
+        0x46 => "print_screen".into(),
         0x4A => "home".into(),
         0x4B => "page_up".into(),
         0x4C => "delete_forward".into(),
@@ -312,9 +313,46 @@ pub struct Button {
     pub action: Action,
 }
 
+/// Which operating system's shortcuts the quick picks use. Left to the user: the dock may be
+/// plugged into a Mac today and a Linux machine tomorrow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetOs {
+    Mac,
+    Linux,
+}
+
+impl TargetOs {
+    pub fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            TargetOs::Mac
+        } else {
+            TargetOs::Linux
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TargetOs::Mac => "macOS",
+            TargetOs::Linux => "Linux",
+        }
+    }
+}
+
+impl Default for TargetOs {
+    fn default() -> Self {
+        TargetOs::current()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub buttons: Vec<Button>,
+    #[serde(default)]
+    pub target_os: TargetOs,
+    /// The welcome guide is shown until the user dismisses it once.
+    #[serde(default)]
+    pub seen_guide: bool,
 }
 
 impl Default for Config {
@@ -344,6 +382,8 @@ impl Default for Config {
                     },
                 ),
             ],
+            target_os: TargetOs::current(),
+            seen_guide: false,
         }
     }
 }
@@ -435,54 +475,388 @@ mod tests {
     }
 }
 
-/// One-click actions offered in the editor. Shortcuts are the macOS ones on macOS.
-pub fn presets() -> Vec<(&'static str, Action)> {
-    let shortcut = |ctrl, alt, shift, cmd, key: &str| Action::Shortcut {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Category {
+    Media,
+    Screen,
+    Windows,
+    Meetings,
+    Editing,
+    Custom,
+}
+
+impl Category {
+    pub const ALL: [Category; 6] = [
+        Category::Media,
+        Category::Screen,
+        Category::Windows,
+        Category::Meetings,
+        Category::Editing,
+        Category::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Category::Media => "Media",
+            Category::Screen => "Screen",
+            Category::Windows => "Windows",
+            Category::Meetings => "Meetings",
+            Category::Editing => "Editing",
+            Category::Custom => "Custom",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        use egui_phosphor::regular as i;
+        match self {
+            Category::Media => i::MUSIC_NOTES,
+            Category::Screen => i::MONITOR,
+            Category::Windows => i::SQUARES_FOUR,
+            Category::Meetings => i::VIDEO_CAMERA,
+            Category::Editing => i::PENCIL_SIMPLE,
+            Category::Custom => i::SLIDERS_HORIZONTAL,
+        }
+    }
+}
+
+/// One entry of the quick-pick catalog. `mac` / `linux` is `None` when the OS has no
+/// standard shortcut for it - the entry is then hidden for that OS.
+#[derive(Clone, Debug)]
+pub struct Preset {
+    pub category: Category,
+    pub name: &'static str,
+    pub hint: &'static str,
+    pub icon: &'static str,
+    pub mac: Option<Action>,
+    pub linux: Option<Action>,
+}
+
+impl Preset {
+    pub fn action(&self, os: TargetOs) -> Option<&Action> {
+        match os {
+            TargetOs::Mac => self.mac.as_ref(),
+            TargetOs::Linux => self.linux.as_ref(),
+        }
+    }
+}
+
+fn keys(ctrl: bool, alt: bool, shift: bool, cmd: bool, key: &str) -> Option<Action> {
+    Some(Action::Shortcut {
         ctrl,
         alt,
         shift,
         cmd,
         key: key.into(),
+    })
+}
+
+fn media(key: Media) -> Option<Action> {
+    Some(Action::Media { key })
+}
+
+/// Everything offered as a one-click choice, grouped by category.
+pub fn catalog() -> Vec<Preset> {
+    use Category as C;
+    use egui_phosphor::regular as i;
+    let p = |category, name, hint, icon, mac, linux| Preset {
+        category,
+        name,
+        hint,
+        icon,
+        mac,
+        linux,
     };
-    let media = |key| Action::Media { key };
-    let mut list = vec![
-        ("Play / Pause", media(Media::PlayPause)),
-        ("Next track", media(Media::Next)),
-        ("Previous track", media(Media::Previous)),
-        ("Volume up", media(Media::VolumeUp)),
-        ("Volume down", media(Media::VolumeDown)),
-        ("Mute sound", media(Media::Mute)),
-    ];
-    if cfg!(target_os = "macos") {
-        list.extend([
-            (
-                "Mission Control",
-                shortcut(true, false, false, false, "up_arrow"),
-            ),
-            ("Spotlight", shortcut(false, false, false, true, "spacebar")),
-            ("Screenshot area", shortcut(false, false, true, true, "4")),
-            (
-                "Screenshot to clipboard",
-                shortcut(true, false, true, true, "4"),
-            ),
-            ("Lock screen", shortcut(true, false, false, true, "q")),
-            ("Zoom: mute mic", shortcut(false, false, true, true, "a")),
-            ("Teams: mute mic", shortcut(false, false, true, true, "m")),
-            ("Copy", shortcut(false, false, false, true, "c")),
-            ("Paste", shortcut(false, false, false, true, "v")),
-        ]);
-    } else {
-        list.extend([
-            ("Screenshot", shortcut(false, false, false, false, "f13")), // placeholder, many desktops use Print
-            ("Lock screen", shortcut(false, false, false, true, "l")),
-            ("Zoom: mute mic", shortcut(false, true, false, false, "a")),
-            ("Teams: mute mic", shortcut(true, false, true, false, "m")),
-            ("Copy", shortcut(true, false, false, false, "c")),
-            ("Paste", shortcut(true, false, false, false, "v")),
-        ]);
-    }
-    list.push(("Disable button", Action::Disabled));
-    list
+    // keys(ctrl, alt, shift, cmd/super, key)
+    vec![
+        p(
+            C::Media,
+            "Play / Pause",
+            "Start or pause music and video",
+            i::PLAY_PAUSE,
+            media(Media::PlayPause),
+            media(Media::PlayPause),
+        ),
+        p(
+            C::Media,
+            "Next track",
+            "Skip to the next song",
+            i::SKIP_FORWARD,
+            media(Media::Next),
+            media(Media::Next),
+        ),
+        p(
+            C::Media,
+            "Previous track",
+            "Go back one song",
+            i::SKIP_BACK,
+            media(Media::Previous),
+            media(Media::Previous),
+        ),
+        p(
+            C::Media,
+            "Volume up",
+            "Make it louder",
+            i::SPEAKER_HIGH,
+            media(Media::VolumeUp),
+            media(Media::VolumeUp),
+        ),
+        p(
+            C::Media,
+            "Volume down",
+            "Make it quieter",
+            i::SPEAKER_LOW,
+            media(Media::VolumeDown),
+            media(Media::VolumeDown),
+        ),
+        p(
+            C::Media,
+            "Mute sound",
+            "Toggle the speakers",
+            i::SPEAKER_SLASH,
+            media(Media::Mute),
+            media(Media::Mute),
+        ),
+        p(
+            C::Media,
+            "Brightness up",
+            "Brighter display",
+            i::SUN,
+            media(Media::BrightnessUp),
+            media(Media::BrightnessUp),
+        ),
+        p(
+            C::Media,
+            "Brightness down",
+            "Dimmer display",
+            i::SUN_DIM,
+            media(Media::BrightnessDown),
+            media(Media::BrightnessDown),
+        ),
+        p(
+            C::Screen,
+            "Screenshot",
+            "Capture the whole screen",
+            i::CAMERA,
+            keys(false, false, true, true, "3"),
+            keys(false, false, false, false, "print_screen"),
+        ),
+        p(
+            C::Screen,
+            "Screenshot of an area",
+            "Drag to select what to capture",
+            i::CROP,
+            keys(false, false, true, true, "4"),
+            keys(false, false, true, false, "print_screen"),
+        ),
+        p(
+            C::Screen,
+            "Screenshot to clipboard",
+            "Area capture, ready to paste",
+            i::CLIPBOARD_TEXT,
+            keys(true, false, true, true, "4"),
+            None,
+        ),
+        p(
+            C::Screen,
+            "Record the screen",
+            "Start a screen recording",
+            i::RECORD,
+            keys(false, false, true, true, "5"),
+            keys(true, true, true, false, "r"),
+        ),
+        p(
+            C::Screen,
+            "Lock screen",
+            "Lock the computer right away",
+            i::LOCK,
+            keys(true, false, false, true, "q"),
+            keys(false, false, false, true, "l"),
+        ),
+        p(
+            C::Windows,
+            "All windows",
+            "Mission Control / Activities overview",
+            i::SQUARES_FOUR,
+            keys(true, false, false, false, "up_arrow"),
+            keys(false, false, false, true, "s"),
+        ),
+        p(
+            C::Windows,
+            "Show desktop",
+            "Move all windows out of the way",
+            i::DESKTOP,
+            keys(false, false, false, true, "f3"),
+            keys(false, false, false, true, "d"),
+        ),
+        p(
+            C::Windows,
+            "Next desktop",
+            "Switch to the workspace on the right",
+            i::ARROW_RIGHT,
+            keys(true, false, false, false, "right_arrow"),
+            keys(false, false, false, true, "page_down"),
+        ),
+        p(
+            C::Windows,
+            "Previous desktop",
+            "Switch to the workspace on the left",
+            i::ARROW_LEFT,
+            keys(true, false, false, false, "left_arrow"),
+            keys(false, false, false, true, "page_up"),
+        ),
+        p(
+            C::Windows,
+            "Search apps",
+            "Spotlight / application search",
+            i::MAGNIFYING_GLASS,
+            keys(false, false, false, true, "spacebar"),
+            keys(false, false, false, true, "a"),
+        ),
+        p(
+            C::Windows,
+            "Emoji picker",
+            "Insert an emoji",
+            i::SMILEY,
+            keys(true, false, false, true, "spacebar"),
+            None,
+        ),
+        p(
+            C::Windows,
+            "Close window",
+            "Close the current window or tab",
+            i::X_SQUARE,
+            keys(false, false, false, true, "w"),
+            keys(true, false, false, false, "w"),
+        ),
+        p(
+            C::Meetings,
+            "Zoom: mute mic",
+            "Mute or unmute yourself in Zoom",
+            i::MICROPHONE_SLASH,
+            keys(false, false, true, true, "a"),
+            keys(false, true, false, false, "a"),
+        ),
+        p(
+            C::Meetings,
+            "Zoom: camera",
+            "Turn your Zoom video on or off",
+            i::VIDEO_CAMERA_SLASH,
+            keys(false, false, true, true, "v"),
+            keys(false, true, false, false, "v"),
+        ),
+        p(
+            C::Meetings,
+            "Teams: mute mic",
+            "Mute or unmute yourself in Teams",
+            i::MICROPHONE_SLASH,
+            keys(false, false, true, true, "m"),
+            keys(true, false, true, false, "m"),
+        ),
+        p(
+            C::Meetings,
+            "Teams: camera",
+            "Turn your Teams video on or off",
+            i::VIDEO_CAMERA_SLASH,
+            keys(false, false, true, true, "o"),
+            keys(true, false, true, false, "o"),
+        ),
+        p(
+            C::Meetings,
+            "Meet: mute mic",
+            "Mute or unmute yourself in Google Meet",
+            i::MICROPHONE_SLASH,
+            keys(false, false, false, true, "d"),
+            keys(true, false, false, false, "d"),
+        ),
+        p(
+            C::Meetings,
+            "Meet: camera",
+            "Turn your Google Meet video on or off",
+            i::VIDEO_CAMERA_SLASH,
+            keys(false, false, false, true, "e"),
+            keys(true, false, false, false, "e"),
+        ),
+        p(
+            C::Editing,
+            "Copy",
+            "Copy the selection",
+            i::COPY,
+            keys(false, false, false, true, "c"),
+            keys(true, false, false, false, "c"),
+        ),
+        p(
+            C::Editing,
+            "Paste",
+            "Paste from the clipboard",
+            i::CLIPBOARD,
+            keys(false, false, false, true, "v"),
+            keys(true, false, false, false, "v"),
+        ),
+        p(
+            C::Editing,
+            "Cut",
+            "Cut the selection",
+            i::SCISSORS,
+            keys(false, false, false, true, "x"),
+            keys(true, false, false, false, "x"),
+        ),
+        p(
+            C::Editing,
+            "Undo",
+            "Take back the last change",
+            i::ARROW_U_UP_LEFT,
+            keys(false, false, false, true, "z"),
+            keys(true, false, false, false, "z"),
+        ),
+        p(
+            C::Editing,
+            "Redo",
+            "Redo what you undid",
+            i::ARROW_U_UP_RIGHT,
+            keys(false, false, true, true, "z"),
+            keys(true, false, true, false, "z"),
+        ),
+        p(
+            C::Editing,
+            "Save",
+            "Save the current document",
+            i::FLOPPY_DISK,
+            keys(false, false, false, true, "s"),
+            keys(true, false, false, false, "s"),
+        ),
+        p(
+            C::Editing,
+            "Find",
+            "Search in the current document",
+            i::MAGNIFYING_GLASS_PLUS,
+            keys(false, false, false, true, "f"),
+            keys(true, false, false, false, "f"),
+        ),
+        p(
+            C::Editing,
+            "New tab",
+            "Open a new browser or editor tab",
+            i::PLUS_SQUARE,
+            keys(false, false, false, true, "t"),
+            keys(true, false, false, false, "t"),
+        ),
+    ]
+}
+
+/// The catalog entries available for one OS, with the action to assign.
+pub fn presets_for(os: TargetOs) -> Vec<(Preset, Action)> {
+    catalog()
+        .into_iter()
+        .filter_map(|p| p.action(os).cloned().map(|a| (p, a)))
+        .collect()
+}
+
+/// Catalog entry that matches an action (used to show its name and icon), if any.
+pub fn preset_for_action(action: &Action, os: TargetOs) -> Option<Preset> {
+    presets_for(os)
+        .into_iter()
+        .find(|(_, a)| a == action)
+        .map(|(p, _)| p)
 }
 
 /// Karabiner key name for a key pressed in the UI (shortcut recording).
@@ -527,17 +901,82 @@ mod preset_tests {
     use super::*;
 
     #[test]
-    fn presets_are_valid_and_unique() {
-        let list = presets();
-        let mut names: Vec<_> = list.iter().map(|(n, _)| *n).collect();
-        names.dedup();
-        assert_eq!(names.len(), list.len());
+    fn catalog_is_valid_for_both_systems() {
         let keys = shortcut_keys();
-        for (_, action) in &list {
-            if let Action::Shortcut { key, .. } = action {
-                assert!(keys.contains(key), "unknown key {key}");
+        for os in [TargetOs::Mac, TargetOs::Linux] {
+            let list = presets_for(os);
+            assert!(
+                list.len() >= 25,
+                "{os:?} has only {} quick picks",
+                list.len()
+            );
+            let mut names: Vec<_> = list.iter().map(|(p, _)| p.name).collect();
+            names.sort();
+            names.dedup();
+            assert_eq!(names.len(), list.len(), "duplicate names for {os:?}");
+            for (preset, action) in &list {
+                if let Action::Shortcut { key, .. } = action {
+                    assert!(keys.contains(key), "{}: unknown key {key}", preset.name);
+                }
+                assert!(!preset.hint.is_empty());
+            }
+            // Every category except Custom (handled by the UI) has something to offer
+            for cat in Category::ALL.iter().filter(|c| **c != Category::Custom) {
+                assert!(
+                    list.iter().any(|(p, _)| p.category == *cat),
+                    "{os:?}: empty {cat:?}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn shortcuts_differ_per_system() {
+        let lock = catalog()
+            .into_iter()
+            .find(|p| p.name == "Lock screen")
+            .unwrap();
+        assert_eq!(
+            lock.action(TargetOs::Mac),
+            keys(true, false, false, true, "q").as_ref()
+        );
+        assert_eq!(
+            lock.action(TargetOs::Linux),
+            keys(false, false, false, true, "l").as_ref()
+        );
+        let mac_only = catalog()
+            .into_iter()
+            .find(|p| p.name == "Emoji picker")
+            .unwrap();
+        assert!(mac_only.action(TargetOs::Linux).is_none());
+        assert!(
+            presets_for(TargetOs::Linux)
+                .iter()
+                .all(|(p, _)| p.name != "Emoji picker")
+        );
+    }
+
+    #[test]
+    fn preset_lookup_by_action() {
+        let play = Action::Media {
+            key: Media::PlayPause,
+        };
+        assert_eq!(
+            preset_for_action(&play, TargetOs::Mac).unwrap().name,
+            "Play / Pause"
+        );
+        assert!(preset_for_action(&Action::Disabled, TargetOs::Mac).is_none());
+    }
+
+    #[test]
+    fn old_config_without_new_fields_still_loads() {
+        let json = serde_json::to_value(Config::default()).unwrap();
+        let mut obj = json.as_object().unwrap().clone();
+        obj.remove("target_os");
+        obj.remove("seen_guide");
+        let back: Config = serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+        assert_eq!(back.target_os, TargetOs::current());
+        assert!(!back.seen_guide);
     }
 
     #[test]
