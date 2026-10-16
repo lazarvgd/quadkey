@@ -73,8 +73,7 @@ fn join(block: &mut [u8; 8], v0: u32, v1: u32) {
 pub fn seal(plain: &[u8]) -> [u8; 64] {
     let mut out = [0u8; 64];
     out[..plain.len().min(64)].copy_from_slice(&plain[..plain.len().min(64)]);
-    for chunk in out.chunks_exact_mut(8) {
-        let block: &mut [u8; 8] = chunk.try_into().expect("8-byte chunk");
+    for block in out.as_chunks_mut::<8>().0 {
         tea_encrypt(block);
     }
     out
@@ -83,8 +82,7 @@ pub fn seal(plain: &[u8]) -> [u8; 64] {
 pub fn unseal(data: &[u8]) -> [u8; 64] {
     let mut out = [0u8; 64];
     out[..data.len().min(64)].copy_from_slice(&data[..data.len().min(64)]);
-    for chunk in out.chunks_exact_mut(8) {
-        let block: &mut [u8; 8] = chunk.try_into().expect("8-byte chunk");
+    for block in out.as_chunks_mut::<8>().0 {
         tea_decrypt(block);
     }
     out
