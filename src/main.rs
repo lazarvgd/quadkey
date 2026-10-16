@@ -7,8 +7,10 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("QuadKey")
-            .with_inner_size([860.0, 560.0])
-            .with_min_inner_size([760.0, 500.0]),
+            // Big enough to show the dock and the actions without resizing, small enough for a
+            // 13" laptop screen (1512 x 982 points)
+            .with_inner_size([1120.0, 880.0])
+            .with_min_inner_size([1040.0, 720.0]),
         ..Default::default()
     };
     eframe::run_native(

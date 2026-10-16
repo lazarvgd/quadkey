@@ -54,7 +54,10 @@ fn render_main_window() {
         };
     }
     let mut h = Harness::builder()
-        .with_size(Vec2::new(1100.0, 860.0))
+        .with_size(Vec2::new(
+            env_f32("W").unwrap_or(1120.0),
+            env_f32("H").unwrap_or(880.0),
+        ))
         .with_pixels_per_point(2.0)
         .wgpu()
         .build_ui_state(|ui, app: &mut DockStudio| app.draw(ui), app);
@@ -79,4 +82,8 @@ fn render_main_window() {
     image
         .save(std::env::var("SHOT").unwrap_or("/tmp/quadkey.png".into()))
         .unwrap();
+}
+
+fn env_f32(name: &str) -> Option<f32> {
+    std::env::var(name).ok()?.parse().ok()
 }

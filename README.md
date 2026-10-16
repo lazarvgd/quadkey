@@ -43,7 +43,7 @@ Every control — each of the four buttons, turning the knob left, turning it ri
 | **Media** | Play / Pause, next track, previous track, volume up, volume down, mute, brightness up, brightness down |
 | **Screen** | screenshot, screenshot of an area, screenshot to the clipboard, record the screen, lock screen, dark mode on/off |
 | **Windows** | all windows (Mission Control / Activities), show desktop, next desktop, previous desktop, search apps, emoji picker, close window |
-| **Meetings** | mute the microphone in any app, mute the mic or toggle the camera in Zoom, Microsoft Teams and Google Meet |
+| **Meetings** | microphone and camera on/off in Zoom, Microsoft Teams and Google Meet, the mic in Slack huddles, sound on/off in Discord, and the system microphone (on macOS the input level — Teams and Zoom may raise it again, so use their own mute there) |
 | **Editing** | copy, paste, cut, undo, redo, save, find, new tab |
 | **Custom** | record any shortcut by typing it, build a shortcut by hand, open an application, run your own shell command, toggle between two actions, do nothing, or keep the factory behaviour |
 
@@ -77,7 +77,7 @@ sudo udevadm control --reload && sudo udevadm trigger
 
 1. **Pick a control.** Click one of the four button tiles or one of the three knob tiles. When you use the dock, the matching tile lights up, so you always know which is which.
 2. **Choose what it does.** Pick a category (Media, Screen, Windows, Meetings, Editing, Custom) and click an action. The tile now shows a yellow dot and *not applied yet*.
-3. **Click Apply.** Nothing changes on the dock until you do, so a stray click is harmless. The message at the bottom lists exactly what changed, for example *Applied: Button 3 → Zoom: mute mic*.
+3. **Click Apply.** Nothing changes on the dock until you do, so a stray click is harmless. The message at the bottom lists exactly what changed, for example *Applied: Button 3 → Zoom: mic on/off*.
 4. **Try it.** Use the control on the dock. Its tile lights up; under **⋯ → Show activity** you can see what the dock sent and what QuadKey did.
 
 Changed your mind? **Discard** throws away everything that is not applied yet. **⋯ → Reset everything to factory** gives the dock its out-of-the-box behaviour back.

@@ -331,7 +331,7 @@ fn every_category_offers_options_to_every_control() {
             (Category::Media, "Play / Pause"),
             (Category::Screen, "Screenshot"),
             (Category::Windows, "Show desktop"),
-            (Category::Meetings, "Zoom: mute mic"),
+            (Category::Meetings, "Zoom: mic on/off"),
             (Category::Editing, "Copy"),
         ] {
             h.get_by_label(&tab(category)).click();
@@ -411,7 +411,7 @@ fn knob_can_be_reassigned() {
     h.get_by_label("Press");
     h.get_by_label(&tab(Category::Meetings)).click();
     h.run_steps(4);
-    h.get_by_label("Mute microphone (all apps)").click();
+    h.get_by_label("System mic level on/off").click();
     h.run_steps(4);
     assert!(matches!(
         h.state().config.buttons[KNOB_PRESS].action,

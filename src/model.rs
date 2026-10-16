@@ -661,13 +661,16 @@ impl Preset {
             self.name,
             "Play / Pause"
                 | "Mute / unmute sound"
-                | "Zoom: mute mic"
-                | "Zoom: camera"
-                | "Teams: mute mic"
-                | "Teams: camera"
-                | "Meet: mute mic"
-                | "Meet: camera"
-                | "Mute microphone (all apps)"
+                | "Zoom: mic on/off"
+                | "Zoom: camera on/off"
+                | "Teams: mic on/off"
+                | "Teams: camera on/off"
+                | "Meet: mic on/off"
+                | "Meet: camera on/off"
+                | "Slack huddle: mic on/off"
+                | "Discord: sound on/off"
+                | "System mic level on/off"
+                | "System mic on/off"
                 | "Dark mode on/off"
                 | "Show desktop"
                 | "All windows"
@@ -885,58 +888,82 @@ pub fn catalog() -> Vec<Preset> {
         ),
         p(
             C::Meetings,
-            "Zoom: mute mic",
-            "Mute or unmute yourself in Zoom",
+            "Zoom: mic on/off",
+            "Mute or unmute yourself · Zoom window in front",
             i::MICROPHONE_SLASH,
             keys(false, false, true, true, "a"),
             keys(false, true, false, false, "a"),
         ),
         p(
             C::Meetings,
-            "Zoom: camera",
-            "Turn your Zoom video on or off",
+            "Zoom: camera on/off",
+            "Start or stop your video · Zoom window in front",
             i::VIDEO_CAMERA_SLASH,
             keys(false, false, true, true, "v"),
             keys(false, true, false, false, "v"),
         ),
         p(
             C::Meetings,
-            "Teams: mute mic",
-            "Mute or unmute yourself in Teams",
+            "Teams: mic on/off",
+            "Mute or unmute yourself · Teams window in front",
             i::MICROPHONE_SLASH,
             keys(false, false, true, true, "m"),
             keys(true, false, true, false, "m"),
         ),
         p(
             C::Meetings,
-            "Teams: camera",
-            "Turn your Teams video on or off",
+            "Teams: camera on/off",
+            "Start or stop your video · Teams window in front",
             i::VIDEO_CAMERA_SLASH,
             keys(false, false, true, true, "o"),
             keys(true, false, true, false, "o"),
         ),
         p(
             C::Meetings,
-            "Meet: mute mic",
-            "Mute or unmute yourself in Google Meet",
+            "Meet: mic on/off",
+            "Mute or unmute yourself · Meet tab in front",
             i::MICROPHONE_SLASH,
             keys(false, false, false, true, "d"),
             keys(true, false, false, false, "d"),
         ),
         p(
             C::Meetings,
-            "Meet: camera",
-            "Turn your Google Meet video on or off",
+            "Meet: camera on/off",
+            "Start or stop your video · Meet tab in front",
             i::VIDEO_CAMERA_SLASH,
             keys(false, false, false, true, "e"),
             keys(true, false, false, false, "e"),
         ),
         p(
             C::Meetings,
-            "Mute microphone (all apps)",
-            "Toggle the system microphone, press again to unmute",
+            "Slack huddle: mic on/off",
+            "Mute or unmute yourself · Slack window in front",
+            i::MICROPHONE_SLASH,
+            keys(false, false, true, true, "spacebar"),
+            keys(true, false, true, false, "spacebar"),
+        ),
+        p(
+            C::Meetings,
+            "Discord: sound on/off",
+            "Deafen or undeafen yourself · Discord window in front",
+            i::HEADPHONES,
+            keys(false, false, true, true, "d"),
+            keys(true, false, true, false, "d"),
+        ),
+        p(
+            C::Meetings,
+            "System mic level on/off",
+            "Sets the mic level to 0 and back · Teams and Zoom may raise it again, use their own mute",
             i::MICROPHONE_SLASH,
             cmd(MAC_MIC_TOGGLE),
+            None,
+        ),
+        p(
+            C::Meetings,
+            "System mic on/off",
+            "Mutes the default microphone for every app",
+            i::MICROPHONE_SLASH,
+            None,
             cmd(LINUX_MIC_TOGGLE),
         ),
         p(
@@ -1101,7 +1128,12 @@ mod preset_tests {
             names.sort();
             names.dedup();
             assert_eq!(names.len(), list.len(), "duplicate names for {os:?}");
-            for (preset, action) in &list {
+            for (n, (preset, action)) in list.iter().enumerate() {
+                assert!(
+                    list[..n].iter().all(|(_, other)| other != action),
+                    "{} ({os:?}) sends the same as another quick pick",
+                    preset.name
+                );
                 if let Action::Shortcut { key, .. } = action {
                     assert!(keys.contains(key), "{}: unknown key {key}", preset.name);
                 }
