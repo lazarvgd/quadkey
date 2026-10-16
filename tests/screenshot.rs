@@ -31,6 +31,12 @@ fn render_main_window() {
         app: "/Applications/Zoom.app".into(),
     };
     app.selected = 2;
+    if let Ok(tab) = std::env::var("TAB") {
+        app.tab = quadkey::model::Category::ALL
+            .into_iter()
+            .find(|c| c.label().eq_ignore_ascii_case(&tab))
+            .expect("TAB is a category name");
+    }
     if std::env::var("TOGGLE").is_ok() {
         // The toggle editor, as after clicking "Toggle between two"
         app.tab = quadkey::model::Category::Custom;

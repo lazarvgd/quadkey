@@ -103,7 +103,8 @@ Your choices are saved as you make them, so nothing is lost if you close the win
 | **Discard** | Throw away changes that are not applied yet. |
 | **Status (top bar)** | *Ready* when the dock does what you see. Otherwise it names what is missing: the dock is not connected, Input Monitoring is not allowed, or changes are not applied. Hover it for details. |
 | **Help** | A short guide, an explanation of every control, and answers to common questions. It also opens on first start. |
-| **⋯ (More)** | Choose whether shortcuts are for macOS or Linux, show the activity log, or reset everything to factory. |
+| **Shortcuts for macOS / Linux** | Above the actions. Ready-made actions use that system's shortcuts — for example *Lock screen* is Ctrl+Cmd+Q on macOS and Super+L on Linux. Pick the system you use the dock with; the shortcuts are stored in the dock. |
+| **⋯ (More)** | Show the activity log, or reset everything to factory. |
 
 The window follows your system's light or dark appearance.
 

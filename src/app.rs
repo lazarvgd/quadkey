@@ -665,17 +665,6 @@ impl DockStudio {
         ));
         let (response, _) = menu.ui(ui, |ui| {
             ui.set_min_width(260.0);
-            ui.label(RichText::new("Shortcuts are for").size(12.0).color(pal.dim));
-            for os in [TargetOs::Mac, TargetOs::Linux] {
-                if ui.radio(self.config.target_os == os, os.label()).clicked()
-                    && self.config.target_os != os
-                {
-                    self.config.target_os = os;
-                    self.tab = tab_for(&self.config.buttons[self.selected], os);
-                    self.persist();
-                }
-            }
-            ui.separator();
             let text = if self.show_activity {
                 "Hide activity"
             } else {
@@ -705,7 +694,29 @@ impl DockStudio {
                 }
             }
         });
-        response.on_hover_text("More: macOS/Linux shortcuts, activity, reset");
+        response.on_hover_text("More: activity, reset");
+    }
+
+    /// Which system the ready-made shortcuts are for, e.g. Lock screen = Ctrl+Cmd+Q or Super+L.
+    fn system_switch(&mut self, ui: &mut egui::Ui, pal: Palette) {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        // Right to left: Linux is added first so macOS ends up on the left
+        for os in [TargetOs::Linux, TargetOs::Mac] {
+            let active = self.config.target_os == os;
+            let response = ui
+                .add(pill_button(os.label(), pal, active))
+                .on_hover_text(format!(
+                    "Use {} shortcuts for the ready-made actions",
+                    os.label()
+                ));
+            if response.clicked() && !active {
+                self.config.target_os = os;
+                self.tab = tab_for(&self.config.buttons[self.selected], os);
+                self.persist();
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Shortcuts for").size(13.0).color(pal.dim));
     }
 
     fn dock_card(&mut self, ui: &mut egui::Ui, pal: Palette, now: f64) {
@@ -1071,16 +1082,23 @@ impl DockStudio {
             });
         ui.add_space(20.0);
 
-        ui.label(
-            RichText::new("Choose what it does")
-                .font(medium(15.0))
-                .color(pal.text),
-        );
-        ui.label(
-            RichText::new("Pick an action, then click Apply at the bottom.")
-                .size(13.0)
-                .color(pal.dim),
-        );
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Choose what it does")
+                        .font(medium(15.0))
+                        .color(pal.text),
+                );
+                ui.label(
+                    RichText::new("Pick an action, then click Apply at the bottom.")
+                        .size(13.0)
+                        .color(pal.dim),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.system_switch(ui, pal);
+            });
+        });
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
@@ -1117,15 +1135,17 @@ impl DockStudio {
                 for (i, (preset, action)) in presets.into_iter().enumerate() {
                     let active = self.config.buttons[index].action == action;
                     // Shortcuts show their keys; other actions are described by the hint
-                    let hint = match &action {
-                        Action::Shortcut { .. } => {
-                            format!("{} · {}", preset.hint, action.summary())
-                        }
-                        _ => preset.hint.to_string(),
+                    let keys = action.keys_for(self.config.target_os);
+                    let hint = match &keys {
+                        Some(keys) => format!("{} · {keys}", preset.hint),
+                        None => preset.hint.to_string(),
                     };
-                    if option_card(ui, pal, preset.icon, preset.name, &hint, active, width)
-                        .clicked()
-                    {
+                    let card = option_card(ui, pal, preset.icon, preset.name, &hint, active, width);
+                    let card = match &keys {
+                        Some(keys) => card.on_hover_text(format!("{} - sends {keys}", preset.hint)),
+                        None => card.on_hover_text(preset.hint),
+                    };
+                    if card.clicked() {
                         self.assign(action);
                     }
                     if i % columns == columns - 1 {
@@ -1723,9 +1743,14 @@ fn help_controls(ui: &mut egui::Ui, pal: Palette) {
             "Ready means the dock does what you see. Otherwise it says what is missing; hover it for details.",
         ),
         (
+            icon::MONITOR,
+            "Shortcuts for macOS / Linux",
+            "Above the actions. Ready-made actions use that system's shortcuts - for example Lock screen is Ctrl+Cmd+Q on macOS and Super+L on Linux. Pick the system you use the dock with.",
+        ),
+        (
             icon::DOTS_THREE,
             "More (⋯)",
-            "Choose whether shortcuts are for macOS or Linux, show the activity log, or reset everything to factory.",
+            "Show the activity log, or reset everything to factory.",
         ),
         (
             icon::LIST_BULLETS,
@@ -1761,7 +1786,7 @@ fn help_questions(ui: &mut egui::Ui, pal: Palette) {
         ),
         (
             "Does it work on Linux?",
-            "Yes. Choose \"Shortcuts are for: Linux\" under More (⋯) if you mostly use the dock on Linux.",
+            "Yes. Choose Linux next to \"Shortcuts for\" above the actions if you mostly use the dock on Linux.",
         ),
         (
             "How do I undo everything?",
@@ -2005,7 +2030,7 @@ pub fn action_name(action: &Action, os: TargetOs) -> String {
         Action::Toggle { first, second } => {
             format!("{} / {}", action_name(first, os), action_name(second, os))
         }
-        other => other.summary(),
+        other => other.keys_for(os).unwrap_or_else(|| other.summary()),
     }
 }
 

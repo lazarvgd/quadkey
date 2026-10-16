@@ -158,10 +158,24 @@ pub fn key_label(usage: u8) -> String {
             "delete_forward" => "Delete".into(),
             "page_up" => "Page Up".into(),
             "page_down" => "Page Down".into(),
-            other if other.ends_with("_arrow") => other.trim_end_matches("_arrow").to_string(),
-            other => other.to_uppercase(),
+            "hyphen" => "-".into(),
+            "equal_sign" => "=".into(),
+            "print_screen" => "Print Screen".into(),
+            "up_arrow" => "↑".into(),
+            "down_arrow" => "↓".into(),
+            "left_arrow" => "←".into(),
+            "right_arrow" => "→".into(),
+            other => other.to_uppercase().replace('_', " "),
         },
         None => format!("0x{usage:02X}"),
+    }
+}
+
+/// Human-readable label for a key name used in shortcuts ("equal_sign" -> "=").
+pub fn key_label_of(name: &str) -> String {
+    match (0x04u8..=0x73).find(|&u| key_name(u).as_deref() == Some(name)) {
+        Some(usage) => key_label(usage),
+        None => name.to_uppercase(),
     }
 }
 
@@ -263,52 +277,48 @@ impl Action {
         }
     }
 
+    /// The keys of a shortcut, named the way the target system names them ("Cmd+W" / "Super+L").
+    pub fn keys_for(&self, os: TargetOs) -> Option<String> {
+        let Action::Shortcut {
+            ctrl,
+            alt,
+            shift,
+            cmd,
+            key,
+        } = self
+        else {
+            return None;
+        };
+        let (alt_name, cmd_name) = match os {
+            TargetOs::Mac => ("Option", "Cmd"),
+            TargetOs::Linux => ("Alt", "Super"),
+        };
+        let mut parts: Vec<String> = [
+            (ctrl, "Ctrl"),
+            (alt, alt_name),
+            (shift, "Shift"),
+            (cmd, cmd_name),
+        ]
+        .into_iter()
+        .filter(|(on, _)| **on)
+        .map(|(_, name)| name.to_string())
+        .collect();
+        parts.push(key_label_of(key));
+        Some(parts.join("+"))
+    }
+
     pub fn summary(&self) -> String {
         match self {
             Action::Original => "Original".into(),
             Action::Disabled => "Disabled".into(),
             Action::Media { key } => key.label().into(),
-            Action::Shortcut {
-                ctrl,
-                alt,
-                shift,
-                cmd,
-                key,
-            } => {
-                let mut parts = Vec::new();
-                if *ctrl {
-                    parts.push("Ctrl".to_string());
-                }
-                if *alt {
-                    parts.push(
-                        if cfg!(target_os = "macos") {
-                            "Option"
-                        } else {
-                            "Alt"
-                        }
-                        .to_string(),
-                    );
-                }
-                if *shift {
-                    parts.push("Shift".to_string());
-                }
-                if *cmd {
-                    parts.push(
-                        if cfg!(target_os = "macos") {
-                            "Cmd"
-                        } else {
-                            "Super"
-                        }
-                        .to_string(),
-                    );
-                }
-                parts.push(if key.len() == 1 {
-                    key.to_uppercase()
+            Action::Shortcut { .. } => self
+                .keys_for(if cfg!(target_os = "macos") {
+                    TargetOs::Mac
                 } else {
-                    key.clone()
-                });
-                parts.join("+")
-            }
+                    TargetOs::Linux
+                })
+                .unwrap_or_default(),
             Action::OpenApp { app } => {
                 let name = std::path::Path::new(app)
                     .file_stem()
@@ -488,6 +498,28 @@ mod tests {
             }),
             Some(3)
         );
+    }
+
+    #[test]
+    fn shortcut_keys_follow_the_target_system() {
+        let lock = Action::Shortcut {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            cmd: true,
+            key: "l".into(),
+        };
+        assert_eq!(lock.keys_for(TargetOs::Mac).unwrap(), "Cmd+L");
+        assert_eq!(lock.keys_for(TargetOs::Linux).unwrap(), "Super+L");
+        let zoom = Action::Shortcut {
+            ctrl: true,
+            alt: false,
+            shift: false,
+            cmd: false,
+            key: "equal_sign".into(),
+        };
+        assert_eq!(zoom.keys_for(TargetOs::Linux).unwrap(), "Ctrl+=");
+        assert_eq!(Action::Disabled.keys_for(TargetOs::Mac), None);
     }
 
     #[test]

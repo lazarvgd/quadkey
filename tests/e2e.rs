@@ -617,13 +617,10 @@ fn shortcuts_follow_the_chosen_system() {
     let (fx, app) = fixture(true);
     let mut h = harness(app);
     h.run_steps(4);
-    h.get_by_label(egui_phosphor::regular::DOTS_THREE).click();
-    h.run_steps(4);
+    h.get_by_label("Shortcuts for");
     h.get_by_label("Linux").click();
     h.run_steps(4);
     assert_eq!(h.state().config.target_os, TargetOs::Linux);
-    h.key_press(Key::Escape); // close the menu
-    h.run_steps(4);
     h.get_by_label(&tab(Category::Screen)).click();
     h.run_steps(4);
     h.get_by_label("Lock screen").click();
