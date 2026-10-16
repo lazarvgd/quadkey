@@ -622,6 +622,26 @@ pub struct Preset {
 }
 
 impl Preset {
+    /// Actions that undo themselves on the next press (mute / unmute, play / pause...). They
+    /// need no "toggle between two".
+    pub fn switches_back(&self) -> bool {
+        matches!(
+            self.name,
+            "Play / Pause"
+                | "Mute / unmute sound"
+                | "Zoom: mute mic"
+                | "Zoom: camera"
+                | "Teams: mute mic"
+                | "Teams: camera"
+                | "Meet: mute mic"
+                | "Meet: camera"
+                | "Mute microphone (all apps)"
+                | "Dark mode on/off"
+                | "Show desktop"
+                | "All windows"
+        )
+    }
+
     pub fn action(&self, os: TargetOs) -> Option<&Action> {
         match os {
             TargetOs::Mac => self.mac.as_ref(),
@@ -713,8 +733,8 @@ pub fn catalog() -> Vec<Preset> {
         ),
         p(
             C::Media,
-            "Mute sound",
-            "Toggle the speakers",
+            "Mute / unmute sound",
+            "Press again to hear sound again",
             i::SPEAKER_SLASH,
             media(Media::Mute),
             media(Media::Mute),
@@ -724,7 +744,7 @@ pub fn catalog() -> Vec<Preset> {
             "Brightness up",
             "Brighter display",
             i::SUN,
-            media(Media::BrightnessUp),
+            keys(false, false, false, false, "f15"),
             media(Media::BrightnessUp),
         ),
         p(
@@ -732,7 +752,7 @@ pub fn catalog() -> Vec<Preset> {
             "Brightness down",
             "Dimmer display",
             i::SUN_DIM,
-            media(Media::BrightnessDown),
+            keys(false, false, false, false, "f14"),
             media(Media::BrightnessDown),
         ),
         p(
@@ -947,9 +967,25 @@ pub fn catalog() -> Vec<Preset> {
             C::Editing,
             "Find",
             "Search in the current document",
-            i::MAGNIFYING_GLASS_PLUS,
+            i::TEXT_AA,
             keys(false, false, false, true, "f"),
             keys(true, false, false, false, "f"),
+        ),
+        p(
+            C::Editing,
+            "Zoom in",
+            "Make the page or document bigger",
+            i::MAGNIFYING_GLASS_PLUS,
+            keys(false, false, false, true, "equal_sign"),
+            keys(true, false, false, false, "equal_sign"),
+        ),
+        p(
+            C::Editing,
+            "Zoom out",
+            "Make the page or document smaller",
+            i::MAGNIFYING_GLASS_MINUS,
+            keys(false, false, false, true, "hyphen"),
+            keys(true, false, false, false, "hyphen"),
         ),
         p(
             C::Editing,

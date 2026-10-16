@@ -519,27 +519,13 @@ pub fn keyd_apply(config: &Config) -> Result<()> {
 }
 
 /// Linux: run the program actions ourselves (keyd swallows the key).
-pub fn run_local_action(index: usize, action: &Action) {
-    // Which half of each toggle runs next (keyd keeps its own state for key actions)
-    static NEXT_IS_SECOND: std::sync::Mutex<[bool; crate::model::CONTROLS]> =
-        std::sync::Mutex::new([false; crate::model::CONTROLS]);
-    let action = match action {
-        Action::Toggle { first, second } => {
-            let Ok(mut state) = NEXT_IS_SECOND.lock() else {
-                return;
-            };
-            let Some(second_next) = state.get_mut(index) else {
-                return;
-            };
-            let half = if *second_next { second } else { first };
-            *second_next = !*second_next;
-            half.as_ref().clone()
-        }
-        other => other.clone(),
-    };
+pub fn run_local_action(action: &Action) {
     let command = match action {
-        Action::OpenApp { app } if cfg!(target_os = "linux") => app,
-        Action::Command { command } if cfg!(target_os = "linux") => command,
+        Action::OpenApp { app } if cfg!(target_os = "macos") => {
+            format!("open -a {}", shell_quote(app))
+        }
+        Action::OpenApp { app } => app.clone(),
+        Action::Command { command } => command.clone(),
         _ => return,
     };
     let _ = std::process::Command::new("sh")

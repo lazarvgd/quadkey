@@ -235,11 +235,8 @@ fn choose_apply_and_reset() {
     h.get_by_label("1 change not applied");
     h.get_by_label("Will do after Apply");
 
-    if !cfg!(target_os = "macos") {
-        return; // applying on Linux needs keyd and pkexec
-    }
     assert!(
-        dock_rule(&fx.env).is_none(),
+        fx.written.lock().unwrap().is_empty(),
         "nothing may change before Apply"
     );
     assert!(h.state().can_apply());
@@ -256,22 +253,16 @@ fn choose_apply_and_reset() {
     );
     assert!(h.state().changed_controls().is_empty());
     h.get_by_label("Ready");
-    let rule = dock_rule(&fx.env).expect("dock rule written");
-    let lock = rule["manipulators"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["from"]["key_code"] == "q")
-        .unwrap();
-    assert_eq!(lock["to"][0]["key_code"], "vk_none");
-    assert_eq!(lock["conditions"][0]["identifiers"][0]["vendor_id"], 0xFFF1);
-    assert!(karabiner(&fx.env).to_string().contains("\"Mine\""));
+    // Button 3 (slot 2) now sends F18
     assert!(
-        fx.env
-            .karabiner_json
-            .with_extension("json.quadkey.bak")
-            .exists()
+        fx.written
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m[..9] == [0x01, 0x06, 0x50, 0x00, 0x02, 0x01, 0x01, 0x02, 0x6D])
     );
+    assert!(dock_rule(&fx.env).is_none(), "Karabiner is not used");
+    assert!(karabiner(&fx.env).to_string().contains("\"Mine\""));
 
     // The activity log tells what really happened
     fx.dock.send(DockEvent::PressedButton(2)).unwrap();
@@ -287,10 +278,13 @@ fn choose_apply_and_reset() {
     let restarted = DockStudio::new(fx.env.clone(), rx);
     assert_eq!(restarted.applied.buttons[2].action, Action::Disabled);
 
+    fx.written.lock().unwrap().clear();
     h.state_mut().reset_everything();
     h.run_steps(3);
-    assert!(dock_rule(&fx.env).is_none());
-    assert!(karabiner(&fx.env).to_string().contains("\"Mine\""));
+    // Every control gets its factory function back
+    let written = fx.written.lock().unwrap().clone();
+    assert_eq!(written.len(), 7);
+    assert!(written.contains(&vec![0x01, 0x06, 0x10, 0x04, 0x00, 0x02, 80]));
     assert_eq!(
         h.state().config,
         Config {
@@ -308,7 +302,7 @@ fn discard_returns_to_what_is_applied() {
     h.run_steps(4);
     h.get_by_label(&tab(Category::Media)).click();
     h.run_steps(4);
-    h.get_by_label("Mute sound").click();
+    h.get_by_label("Mute / unmute sound").click();
     h.run_steps(4);
     assert_eq!(
         h.state().config.buttons[0].action,
@@ -370,21 +364,40 @@ fn toggle_between_two_actions() {
     ));
     h.get_by_label("First press");
     h.get_by_label("Second press");
-    if !cfg!(target_os = "macos") {
-        return;
-    }
+    assert!(
+        h.query_by_label("Toggle · Play / Pause").is_none(),
+        "actions that switch back by themselves are not offered"
+    );
+    connect(&fx);
     h.get_by_label("Apply").click();
     h.run_steps(4);
-    let rule = dock_rule(&fx.env).unwrap();
-    let halves: Vec<_> = rule["manipulators"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|m| m["from"]["consumer_key_code"] == "scan_next_track")
-        .collect();
-    assert_eq!(halves.len(), 2, "a toggle becomes two manipulators");
-    assert_eq!(halves[0]["conditions"][1]["type"], "variable_unless");
-    assert_eq!(halves[1]["conditions"][1]["type"], "variable_if");
+    // Button 2 (slot 4) holds the first half: Zoom in = Cmd+=
+    let zoom_in = vec![
+        0x01, 0x06, 0x50, 0x00, 0x04, 0x01, 0x02, 0x03, 0x08, 0x02, 0x2E,
+    ];
+    assert_eq!(
+        fx.written.lock().unwrap().last().unwrap()[..11],
+        zoom_in[..]
+    );
+    // After a press, QuadKey stores the second half: Zoom out = Cmd+-
+    fx.dock
+        .send(DockEvent::Pressed(Trigger::Key {
+            mods: MOD_LGUI,
+            key: 0x2E,
+        }))
+        .unwrap();
+    h.run_steps(3);
+    assert_eq!(fx.written.lock().unwrap().last().unwrap()[10], 0x2D);
+    fx.dock
+        .send(DockEvent::Pressed(Trigger::Key {
+            mods: MOD_LGUI,
+            key: 0x2D,
+        }))
+        .unwrap();
+    h.run_steps(3);
+    assert_eq!(fx.written.lock().unwrap().last().unwrap()[10], 0x2E);
+    let now = h.ctx.input(|i| i.time);
+    assert!(h.state().is_lit(1, now));
 }
 
 #[test]
@@ -404,7 +417,7 @@ fn knob_can_be_reassigned() {
         h.state().config.buttons[KNOB_PRESS].action,
         Action::Command { .. }
     ));
-    h.get_by_label("Runs on this computer while QuadKey or Karabiner is active");
+    h.get_by_label("Runs on this computer while QuadKey is open");
 }
 
 #[test]
@@ -495,10 +508,7 @@ fn shortcuts_and_media_are_written_into_the_dock_without_karabiner() {
 }
 
 #[test]
-fn karabiner_missing_is_explained() {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
+fn computer_actions_need_no_karabiner() {
     let (fx, app) = fixture(false);
     let mut h = harness(app);
     connect(&fx);
@@ -507,15 +517,20 @@ fn karabiner_missing_is_explained() {
     h.run_steps(4);
     h.get_by_label("Do nothing").click();
     h.run_steps(4);
-    assert_eq!(h.state().readiness(), Readiness::NeedsKarabiner);
-    h.get_by_label("Install Karabiner-Elements");
+    assert_eq!(h.state().readiness(), Readiness::NeedsApply);
     h.get_by_label("Apply").click();
     h.run_steps(4);
     let toast = h.state().toast.clone().unwrap();
-    assert!(
-        !toast.ok && toast.text.contains("Karabiner-Elements"),
-        "{}",
-        toast.text
+    assert!(toast.ok, "{}", toast.text);
+    // Button 1 now sends F16, which nothing reacts to
+    let written = fx.written.lock().unwrap().clone();
+    assert_eq!(
+        written[0][..9],
+        [0x01, 0x06, 0x50, 0x00, 0x01, 0x01, 0x01, 0x02, 0x6B]
+    );
+    assert_eq!(
+        h.state().config.buttons[0].trigger,
+        Trigger::Key { mods: 0, key: 0x6B }
     );
     assert!(dock_rule(&fx.env).is_none());
 }
@@ -682,51 +697,13 @@ fn open_application_needs_an_app_before_apply() {
     };
     h.run_steps(4);
     h.get_by_label_contains("Opens Calculator");
-    if cfg!(target_os = "macos") {
-        assert!(h.state().can_apply());
-        h.get_by_label("Apply").click();
-        h.run_steps(4);
-        let rule = dock_rule(&fx.env).unwrap();
-        let m = rule["manipulators"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| m["from"]["key_code"] == "q")
-            .unwrap();
-        assert_eq!(
-            m["to"][0]["shell_command"],
-            "open -a '/Applications/Calculator.app'"
-        );
-    }
-}
-
-#[test]
-fn stopped_karabiner_is_explained() {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let env = Environment {
-        karabiner_installed: true,
-        karabiner_running: Some(false),
-        karabiner_json: dir.path().join("karabiner.json"),
-        config_file: dir.path().join("config.json"),
-    };
-    let mut config = Config {
-        target_os: TargetOs::Mac,
-        seen_guide: true,
-        ..Config::default()
-    };
-    config.buttons[0].action = Action::Disabled;
-    config.save_to(&env.config_file).unwrap();
-    let (tx, rx) = DockStudio::channel();
-    let mut h = harness(DockStudio::new(env, rx));
-    tx.send(DockEvent::Connected {
-        interfaces: 4,
-        keyboard_ok: true,
-    })
-    .unwrap();
+    assert!(h.state().can_apply());
+    h.get_by_label("Apply").click();
     h.run_steps(4);
-    assert_eq!(h.state().readiness(), Readiness::KarabinerStopped);
-    h.get_by_label("Start Karabiner-Elements");
+    // Button 3 sends F18, and QuadKey opens the app when it sees it
+    assert_eq!(
+        h.state().config.buttons[2].trigger,
+        Trigger::Key { mods: 0, key: 0x6D }
+    );
+    assert!(dock_rule(&fx.env).is_none());
 }

@@ -55,28 +55,23 @@ Ready-made actions use the right shortcuts for the system you choose — for exa
 
 ### macOS
 
-1. **Optional: install [Karabiner-Elements](https://karabiner-elements.pqrs.org/)** (free, open source). Shortcuts and media keys are written into the dock itself and need nothing else. Karabiner-Elements is only needed for *Open application*, *Run command*, *Toggle between two* and *Do nothing* — see [when](#when-is-karabiner-elements-needed).
-2. **Install QuadKey:**
+1. **Install QuadKey:**
    - download `QuadKey-macos.zip` from the [latest release](https://github.com/lazarvgd/quadkey/releases/latest), unzip it and move **QuadKey.app** to *Applications*. The app is not signed with an Apple Developer certificate, so the first time **right-click it and choose Open**;
    - or build it yourself: `cargo install --git https://github.com/lazarvgd/quadkey` and run `quadkey`.
-3. **Allow Input Monitoring for QuadKey** (System Settings → Privacy & Security → Input Monitoring) so it can see the dock's buttons and light up the tiles. If you start QuadKey from a terminal, allow the terminal instead.
+2. **Allow Input Monitoring for QuadKey** (System Settings → Privacy & Security → Input Monitoring). QuadKey needs it to see the dock's buttons: to light up the tiles, to open apps and run commands, and to switch toggles. If you start QuadKey from a terminal, allow the terminal instead.
+
+Nothing else is needed — no driver, no Karabiner-Elements.
 
 ### Linux
 
 ```bash
-# 1. keyd remaps the dock (Debian/Ubuntu shown; use your distribution's package)
-sudo apt install keyd
-sudo systemctl enable --now keyd
-
-# 2. QuadKey - download the release archive, or build it
+# QuadKey - download the release archive, or build it
 cargo install --git https://github.com/lazarvgd/quadkey
 
-# 3. Let your user read the dock without root (live view, "Open application", "Run command")
+# Let your user talk to the dock without root
 sudo cp linux/70-quadkey.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 ```
-
-On Linux, *Open application*, *Run command* and the system microphone toggle are carried out by QuadKey itself, so keep it running for those.
 
 ## How to use it
 
@@ -101,12 +96,12 @@ Your choices are saved as you make them, so nothing is lost if you close the win
 | **Categories and cards** | Ready-made actions; click one to choose it. |
 | **Record shortcut** | Click, then type a key combination on your keyboard. Esc cancels. |
 | **Choose keys** | Build a shortcut by hand from Ctrl, Option/Alt, Shift, Cmd/Super and a key. |
-| **Open application / Run command** | Start an app or run a shell command you write. These run on the computer, so they need Karabiner-Elements (macOS) or QuadKey running (Linux). |
-| **Toggle between two** | Alternate between two actions on each press. |
+| **Open application / Run command** | Start an app or run a shell command you write. The dock cannot start programs, so it sends an unused key and QuadKey — which must be open — does the rest. |
+| **Toggle between two** | Alternate between two different actions, for example *Zoom in* and *Zoom out*. On/off actions such as *Mute / unmute*, *Play / Pause*, the microphone or the camera already switch back by themselves, so they are not offered here. QuadKey must be open, because it switches the dock to the other action after each press. |
 | **Do nothing** | Switch a control off. |
-| **Apply** | Make the dock use your choices. Greyed out when there is nothing to apply. On Linux it asks for the administrator password. |
+| **Apply** | Write your choices into the dock. Greyed out when there is nothing to apply. |
 | **Discard** | Throw away changes that are not applied yet. |
-| **Status (top bar)** | *Ready* when the dock does what you see. Otherwise it names what is missing: the dock is not connected, Input Monitoring is not allowed, Karabiner-Elements is not installed, or changes are not applied. Hover it for details. |
+| **Status (top bar)** | *Ready* when the dock does what you see. Otherwise it names what is missing: the dock is not connected, Input Monitoring is not allowed, or changes are not applied. Hover it for details. |
 | **Help** | A short guide, an explanation of every control, and answers to common questions. It also opens on first start. |
 | **⋯ (More)** | Choose whether shortcuts are for macOS or Linux, show the activity log, or reset everything to factory. |
 
@@ -114,34 +109,32 @@ The window follows your system's light or dark appearance.
 
 ## How it works
 
-The dock does not need a driver: it presents itself to the computer as an ordinary keyboard, mouse and media-key device. Its configuration lives inside the dock and decides what each control sends.
+The dock does not need a driver: it presents itself to the computer as an ordinary keyboard, mouse and media-key device. Its configuration lives inside the dock and decides what each control sends. When you click Apply, QuadKey writes your choices into the dock over its configuration channel.
 
-**Shortcuts and media keys are written into the dock.** When you click Apply, QuadKey sends them over the dock's configuration channel. The dock keeps them when unplugged and they work on any computer, with nothing installed.
-
-**Everything else runs on the computer.** The dock cannot open an app, run a command, alternate between two actions or stay silent. For those, QuadKey asks your operating system's input remapper to translate what the dock sends — **for this device only**, matched by its USB IDs, so your real keyboard is never affected:
-
-| | Remapper | What QuadKey writes when you click Apply |
+| You choose | Stored in the dock | Needs QuadKey open |
 |---|---|---|
-| macOS | [Karabiner-Elements](https://karabiner-elements.pqrs.org/) | one rule in `~/.config/karabiner/karabiner.json`, limited to vendor `0xFFF1` / product `0x00C2`. Your other Karabiner rules are kept, and a backup of the file is made next to it. |
-| Linux | [keyd](https://github.com/rvaiya/keyd) | `/etc/keyd/quadkey.conf` with `[ids] fff1:00c2`, then `keyd reload` (through `pkexec`). |
+| a shortcut or a ready-made action | the key combination, e.g. Cmd+Shift+A | no — works on any computer |
+| a media key | the dock's own media function | no |
+| *Open application*, *Run command*, *Do nothing* | an unused key, F16–F22 (one per control) | yes, QuadKey reacts to that key |
+| *Toggle between two* | the half that runs next | yes, QuadKey stores the other half after each press |
 
-For those controls the remapper takes over, so the factory shortcuts (lock screen, screenshot) no longer reach the system once you apply.
+F16–F22 are keys no keyboard has and nothing reacts to, so they are safe to use as signals.
 
-QuadKey's own settings are stored in `config.json` (your draft) and `applied.json` (what is active) in the standard configuration folder: `~/Library/Application Support/quadkey/` on macOS and `~/.config/quadkey/` on Linux.
+QuadKey's own settings are stored in `config.json` (your draft) and `applied.json` (what is in the dock) in the standard configuration folder: `~/Library/Application Support/quadkey/` on macOS and `~/.config/quadkey/` on Linux.
 
 ## Frequently asked questions
 
-### When is Karabiner-Elements needed?
+### Do I need Karabiner-Elements or keyd?
 
-Only for actions the dock cannot do by itself: *Open application*, *Run command*, *Toggle between two* and *Do nothing*. macOS does not let ordinary apps take over a keyboard — it is a protection against keyloggers — and Karabiner-Elements is the well-known, open-source tool with the system driver that can. QuadKey sets it up for you. Shortcuts and media keys are written into the dock and need nothing.
+No. Earlier versions of QuadKey used them; now everything is written into the dock. If an old QuadKey rule is still in Karabiner-Elements or keyd, the next Apply removes it.
 
 ### Does the dock keep my settings when I plug it into another computer?
 
-Shortcuts and media keys, yes — they are stored in the dock. Actions that run on the computer only work where QuadKey's rule is installed.
+Shortcuts and media keys, yes — they are stored in the dock. *Open application*, *Run command* and toggles need QuadKey running on that computer.
 
 ### A control still does the old thing.
 
-Look at the status in the top bar. It tells you what is missing — Apply, Karabiner-Elements, or Input Monitoring.
+Look at the status in the top bar. It tells you what is missing — Apply or Input Monitoring.
 
 ### Does the knob still change the volume?
 
@@ -159,7 +152,7 @@ No. TobenONE ships its own Windows software for the dock.
 
 > **Tested only with the TobenONE UDS060 so far.** The dock is identified by its USB IDs (`fff1:00c2`); other docks built on the same chip may work too. Please [open an issue](https://github.com/lazarvgd/quadkey/issues) with your results.
 
-Toggles on Linux use keyd's `togglem`; they are covered by tests but have not been tried on real Linux hardware yet.
+Linux support is covered by tests but has not been tried on real Linux hardware yet.
 
 ## The dock, technically
 
@@ -181,14 +174,14 @@ cargo test --test screenshot -- --ignored    # render the window to /tmp/quadkey
 cargo clippy --all-targets -- -D warnings
 ```
 
-The end-to-end tests drive the real user interface — they click tiles, choose actions, record shortcuts, apply and discard, and simulate the dock — against temporary files, so they never touch your Karabiner configuration.
+The end-to-end tests drive the real user interface — they click tiles, choose actions, record shortcuts, apply and discard, and simulate the dock — against temporary files and a fake dock, so they never touch your real dock or settings.
 
 | Module | Role |
 |---|---|
 | `model.rs` | controls, triggers, actions, the catalog of ready-made actions, saved settings |
-| `device.rs` | background reader for the dock's HID interfaces, plus press notifications from Karabiner |
+| `device.rs` | background reader for the dock's HID interfaces |
 | `dockcfg.rs` | the dock's configuration protocol: encryption, messages, writing a control |
-| `backend.rs` | generating the Karabiner rule and the keyd configuration, applying and removing them |
+| `backend.rs` | running apps and commands; removing rules left by QuadKey 0.2 (Karabiner-Elements / keyd) |
 | `app.rs` | the user interface |
 
 Releases are built by GitHub Actions when a `v*` tag is pushed: a zipped `QuadKey.app` (universal: Apple Silicon and Intel) and a Linux archive.

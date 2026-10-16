@@ -20,7 +20,8 @@ use crate::device::DockEvent;
 use crate::dockcfg;
 use crate::model::{
     Action, Button, CONTROLS, Category, Config, DEVICE_NAME, KNOB_LEFT, KNOB_PRESS, KNOB_RIGHT,
-    Media, TargetOs, is_knob, key_name_from_egui, preset_for_action, presets_for, shortcut_keys,
+    Media, TargetOs, Trigger, is_knob, key_name_from_egui, preset_for_action, presets_for,
+    shortcut_keys,
 };
 
 /// How long a pressed tile stays lit, in seconds.
@@ -118,8 +119,6 @@ pub enum Readiness {
     DockMissing,
     LookingForDock,
     NeedsInputMonitoring,
-    NeedsKarabiner,
-    KarabinerStopped,
     NeedsApply,
 }
 
@@ -151,8 +150,8 @@ pub struct DockStudio {
     lit_at: [Option<f64>; CONTROLS],
     env: Environment,
     events: Receiver<DockEvent>,
-    karabiner_running: bool,
-    karabiner_checked_at: f64,
+    /// Per toggle: whether the second half runs next.
+    toggle_second: [bool; CONTROLS],
     vendor_packets: usize,
     dock_link: Box<dyn Fn() -> anyhow::Result<Box<dyn dockcfg::DockLink>>>,
     now: f64,
@@ -184,8 +183,7 @@ impl DockStudio {
             lit_at: [None; CONTROLS],
             env,
             events,
-            karabiner_running: true,
-            karabiner_checked_at: f64::NEG_INFINITY,
+            toggle_second: [false; CONTROLS],
             vendor_packets: 0,
             dock_link: Box::new(|| {
                 Ok(Box::new(dockcfg::HidDock::open()?) as Box<dyn dockcfg::DockLink>)
@@ -219,11 +217,15 @@ impl DockStudio {
             .collect()
     }
 
-    /// True when Apply would change something (in the dock or in Karabiner / keyd) and every
-    /// choice is complete.
+    /// True when Apply would change something and every choice is complete.
     pub fn can_apply(&self) -> bool {
         self.incomplete().is_none()
-            && (!self.changed_controls().is_empty() || self.env.needs_apply(&self.host_config()))
+            && (!self.changed_controls().is_empty() || self.old_rule_active())
+    }
+
+    /// A rule left behind by QuadKey 0.2 (Karabiner-Elements / keyd), removed on the next Apply.
+    fn old_rule_active(&self) -> bool {
+        self.env.needs_apply(&Config::default())
     }
 
     /// A choice that cannot work yet, e.g. "Open application" without an application.
@@ -243,39 +245,13 @@ impl DockStudio {
         })
     }
 
-    /// Controls whose action the dock cannot do by itself (open an app, run a command, toggle,
-    /// do nothing) - those need Karabiner-Elements or keyd on the computer.
-    pub fn computer_controls(&self) -> Vec<usize> {
-        (0..CONTROLS)
-            .filter(|&i| dockcfg::dock_setting(i, &self.config.buttons[i].action).is_none())
-            .collect()
-    }
-
-    /// The settings for Karabiner / keyd: everything stored in the dock passes through unchanged.
-    fn host_config(&self) -> Config {
-        let mut host = self.config.clone();
-        for (i, button) in host.buttons.iter_mut().enumerate() {
-            if dockcfg::dock_setting(i, &button.action).is_some() {
-                button.action = Action::Original;
-            }
-        }
-        host
-    }
-
     /// Whether the dock already does what the settings say.
     pub fn readiness(&self) -> Readiness {
-        let needs_computer = !self.computer_controls().is_empty();
         match &self.connection {
             Connection::Disconnected => return Readiness::DockMissing,
             Connection::Waiting => return Readiness::LookingForDock,
             Connection::Connected { keyboard_ok: false } => return Readiness::NeedsInputMonitoring,
             Connection::Connected { keyboard_ok: true } => {}
-        }
-        if cfg!(target_os = "macos") && needs_computer && !self.env.karabiner_installed {
-            return Readiness::NeedsKarabiner;
-        }
-        if cfg!(target_os = "macos") && needs_computer && !self.karabiner_running {
-            return Readiness::KarabinerStopped;
         }
         if self.can_apply() {
             return Readiness::NeedsApply;
@@ -325,30 +301,14 @@ impl DockStudio {
         self.persist();
     }
 
-    /// Store in the dock what it can do by itself; hand the rest to Karabiner / keyd.
+    /// Write the changed controls into the dock.
     pub fn apply(&mut self) {
         self.apply_controls(self.changed_controls());
     }
 
     fn apply_controls(&mut self, to_write: Vec<usize>) {
-        let os = self.config.target_os;
-        let describe = |s: &Self, i: usize| {
-            format!(
-                "{} → {}",
-                Self::control_name(i),
-                action_name(&s.config.buttons[i].action, os)
-            )
-        };
-
-        // 1. The dock: shortcuts and media keys are stored in the dock itself
-        let writes: Vec<(usize, dockcfg::DockSetting)> = to_write
-            .iter()
-            .filter_map(|&i| {
-                dockcfg::dock_setting(i, &self.config.buttons[i].action).map(|s| (i, s))
-            })
-            .collect();
         let mut stored = Vec::new();
-        if !writes.is_empty() {
+        if !to_write.is_empty() {
             let mut link = match (self.dock_link)() {
                 Ok(link) => link,
                 Err(err) => {
@@ -356,10 +316,11 @@ impl DockStudio {
                     return;
                 }
             };
-            for (i, setting) in writes {
-                if let Err(err) =
-                    dockcfg::write(link.as_mut(), dockcfg::SLOT_OF_CONTROL[i], &setting)
-                {
+            for i in to_write {
+                let setting = dockcfg::slot_setting(i, &self.config.buttons[i].action, false);
+                if let Err(err) = self.write_slot(link.as_mut(), i, &setting) {
+                    self.persist();
+                    let _ = self.applied.save_to(&applied_path(&self.env));
                     self.show_toast(
                         false,
                         format!(
@@ -369,78 +330,102 @@ impl DockStudio {
                     );
                     return;
                 }
-                // The dock now sends something else for this control - recognise it by that
-                if let Some(trigger) = dockcfg::trigger_for(i, &setting) {
-                    self.config.buttons[i].trigger = trigger;
-                }
+                self.toggle_second[i] = false;
                 self.applied.buttons[i] = self.config.buttons[i].clone();
-                stored.push(describe(self, i));
+                stored.push(format!(
+                    "{} → {}",
+                    Self::control_name(i),
+                    action_name(&self.config.buttons[i].action, self.config.target_os)
+                ));
             }
             self.persist();
         }
-
-        // 2. The computer: apps, commands, toggles and "do nothing"
-        let host = self.host_config();
-        let computer: Vec<usize> = to_write
-            .iter()
-            .copied()
-            .filter(|i| self.computer_controls().contains(i))
-            .collect();
-        let mut host_error = None;
-        if self.env.needs_apply(&host) {
-            let all_factory = host.buttons.iter().all(|b| b.action == Action::Original);
-            let result = if all_factory {
-                self.env.remove()
-            } else if cfg!(target_os = "macos") && !self.env.karabiner_installed {
-                Err(anyhow::anyhow!(
-                    "opening apps and running commands needs Karabiner-Elements"
-                ))
-            } else {
-                self.env.apply(&host)
-            };
-            if let Err(err) = result {
-                host_error = Some(err.to_string());
-            }
-        }
-        if host_error.is_none() {
-            for &i in &computer {
-                self.applied.buttons[i] = self.config.buttons[i].clone();
-            }
+        // Clean up after QuadKey 0.2, which remapped the dock with Karabiner-Elements / keyd
+        if self.old_rule_active()
+            && let Err(err) = self.env.remove()
+        {
+            self.show_toast(false, format!("Saved in the dock, but the old Karabiner / keyd rule could not be removed: {err}"));
+            return;
         }
         if let Err(err) = self.applied.save_to(&applied_path(&self.env)) {
             self.show_toast(false, format!("Applied, but could not remember it: {err}"));
             return;
         }
-
-        let mut parts = Vec::new();
-        if !stored.is_empty() {
-            parts.push(format!("Saved in the dock: {}", stored.join(", ")));
-        }
-        let computer_done: Vec<String> = if host_error.is_none() {
-            computer.iter().map(|&i| describe(self, i)).collect()
+        let text = if stored.is_empty() {
+            "Applied - use the dock to try it".to_string()
         } else {
-            Vec::new()
+            format!("Saved in the dock: {}", stored.join(", "))
         };
-        if !computer_done.is_empty() {
-            parts.push(format!(
-                "Applied on this computer: {}",
-                computer_done.join(", ")
+        self.show_toast(true, text);
+    }
+
+    /// Store a setting in a control's slot and recognise the control by what it sends from now on.
+    fn write_slot(
+        &mut self,
+        link: &mut dyn dockcfg::DockLink,
+        i: usize,
+        setting: &dockcfg::DockSetting,
+    ) -> anyhow::Result<()> {
+        dockcfg::write(link, dockcfg::SLOT_OF_CONTROL[i], setting)?;
+        if let Some(trigger) = dockcfg::trigger_for(i, setting) {
+            self.config.buttons[i].trigger = trigger;
+            self.applied.buttons[i].trigger = trigger;
+        }
+        Ok(())
+    }
+
+    /// A control was used: carry out what the dock cannot do itself, and move a toggle on.
+    fn run_press(&mut self, index: usize, trigger: Trigger) {
+        let action = self.applied.buttons[index].action.clone();
+        let Action::Toggle { first, second } = &action else {
+            backend::run_local_action(&action);
+            return;
+        };
+        let halves = [
+            dockcfg::slot_setting(index, &action, false),
+            dockcfg::slot_setting(index, &action, true),
+        ];
+        if halves[0] == halves[1] {
+            // The dock sends the same thing for both halves - QuadKey keeps count
+            let half = if self.toggle_second[index] {
+                second
+            } else {
+                first
+            };
+            backend::run_local_action(half);
+            self.toggle_second[index] = !self.toggle_second[index];
+            return;
+        }
+        // The dock did the half it holds; which one is told by what it sent
+        let sent_second = dockcfg::trigger_for(index, &halves[1]) == Some(trigger);
+        backend::run_local_action(if sent_second { second } else { first });
+        self.toggle_second[index] = !sent_second;
+        let next = halves[usize::from(!sent_second)].clone();
+        let result =
+            (self.dock_link)().and_then(|mut link| self.write_slot(link.as_mut(), index, &next));
+        if let Err(err) = result {
+            self.push_log(format!(
+                "{}: could not switch the toggle: {err}",
+                Self::control_name(index)
             ));
         }
-        match host_error {
-            Some(err) => {
-                let mut text = parts.join(". ");
-                if !text.is_empty() {
-                    text.push_str(". ");
-                }
-                text.push_str(&format!("Not applied: {err}"));
-                self.show_toast(false, text);
-            }
-            None if parts.is_empty() => {
-                self.show_toast(true, "Applied - use the dock to try it".into())
-            }
-            None => self.show_toast(true, parts.join(". ")),
-        }
+    }
+
+    /// Which control sent `trigger`. A toggle is recognised by either of its halves.
+    fn control_for(&self, trigger: &Trigger) -> Option<usize> {
+        (0..CONTROLS)
+            .find(|&i| {
+                matches!(self.applied.buttons[i].action, Action::Toggle { .. })
+                    && [false, true].iter().any(|&second| {
+                        dockcfg::trigger_for(
+                            i,
+                            &dockcfg::slot_setting(i, &self.applied.buttons[i].action, second),
+                        )
+                        .as_ref()
+                            == Some(trigger)
+                    })
+            })
+            .or_else(|| self.config.button_for(trigger))
     }
 
     /// Throw the draft away and return to what is active.
@@ -495,10 +480,10 @@ impl DockStudio {
                         ));
                         continue;
                     }
-                    match self.config.button_for(&trigger) {
+                    match self.control_for(&trigger) {
                         Some(index) => {
                             self.lit_at[index] = Some(now);
-                            backend::run_local_action(index, &self.applied.buttons[index].action);
+                            self.run_press(index, trigger);
                             let outcome = self.outcome(index);
                             self.push_log(format!(
                                 "{} · dock sent {} → {outcome}",
@@ -593,10 +578,6 @@ impl DockStudio {
         }
         let now = ui.input(|i| i.time);
         self.now = now;
-        if now - self.karabiner_checked_at > 3.0 {
-            self.karabiner_checked_at = now;
-            self.karabiner_running = self.env.is_karabiner_running();
-        }
         self.process_events(now);
         self.record_shortcut(ui);
         if self.lit_at.iter().flatten().any(|t| now - t < GLOW_SECONDS) {
@@ -667,16 +648,6 @@ impl DockStudio {
                         pal.warn,
                         "Allow Input Monitoring",
                         "System Settings → Privacy & Security → Input Monitoring: turn QuadKey (or your terminal) on, then restart QuadKey.",
-                    ),
-                    Readiness::NeedsKarabiner => (
-                        pal.warn,
-                        "Install Karabiner-Elements",
-                        "Shortcuts and media keys are stored in the dock itself. Opening apps, running commands, toggles and \"do nothing\" run on the computer, and on macOS that needs Karabiner-Elements. Install it once, then click Apply.",
-                    ),
-                    Readiness::KarabinerStopped => (
-                        pal.warn,
-                        "Start Karabiner-Elements",
-                        "Karabiner-Elements is installed but not running. Open it once (Applications → Karabiner-Elements) and allow what it asks for.",
                     ),
                     Readiness::NeedsApply => (pal.warn, "Changes not applied", "Click Apply at the bottom to make the dock use your choices."),
                 };
@@ -1075,11 +1046,9 @@ impl DockStudio {
                         );
                         if action.needs_computer() {
                             ui.label(
-                                RichText::new(
-                                    "Runs on this computer while QuadKey or Karabiner is active",
-                                )
-                                .size(12.0)
-                                .color(pal.dim),
+                                RichText::new("Runs on this computer while QuadKey is open")
+                                    .size(12.0)
+                                    .color(pal.dim),
                             );
                         }
                     });
@@ -1241,15 +1210,15 @@ impl DockStudio {
                 }
                 ui.end_row();
                 let toggle = {
-                    let first = presets_for(os)
-                        .into_iter()
-                        .find(|(p, _)| p.name == "Mute microphone (all apps)")
-                        .map(|(_, a)| a);
+                    let preset = |name: &str| {
+                        presets_for(os)
+                            .into_iter()
+                            .find(|(p, _)| p.name == name)
+                            .map_or(Action::Disabled, |(_, a)| a)
+                    };
                     Action::Toggle {
-                        first: Box::new(first.unwrap_or(Action::Media { key: Media::Mute })),
-                        second: Box::new(Action::Media {
-                            key: Media::PlayPause,
-                        }),
+                        first: Box::new(preset("Zoom in")),
+                        second: Box::new(preset("Zoom out")),
                     }
                 };
                 if option_card(
@@ -1257,7 +1226,7 @@ impl DockStudio {
                     pal,
                     icon::TOGGLE_LEFT,
                     "Toggle between two",
-                    "1st press does one thing, 2nd press another",
+                    "Alternate between two different actions",
                     is(&toggle),
                     width,
                 )
@@ -1408,6 +1377,7 @@ impl DockStudio {
                                 .show_ui(ui, |ui| {
                                     let mut choices: Vec<(String, Action)> = presets_for(os)
                                         .into_iter()
+                                        .filter(|(p, _)| !p.switches_back())
                                         .map(|(p, a)| {
                                             (format!("{} · {}", p.category.label(), p.name), a)
                                         })
@@ -1427,7 +1397,10 @@ impl DockStudio {
                     }
                     ui.label(
                         RichText::new(
-                            "Press once for the first action, again for the second, and so on.",
+                            "Press once for the first action, again for the second, and so on. \
+                             On/off actions such as Mute / unmute, Play / Pause, the microphone or \
+                             the camera already switch back on the next press - choose them \
+                             directly, no toggle needed.",
                         )
                         .size(12.0)
                         .color(pal.dim),
@@ -1469,12 +1442,7 @@ impl DockStudio {
             .min_size(Vec2::new(120.0, 38.0));
             let response = ui.add_enabled(can_apply, apply);
             let response = if can_apply {
-                let how = if cfg!(target_os = "linux") {
-                    " (asks for the administrator password)"
-                } else {
-                    ""
-                };
-                response.on_hover_text(format!("Make the dock use your choices{how}"))
+                response.on_hover_text("Write your choices into the dock")
             } else {
                 response
                     .on_disabled_hover_text("Nothing to apply - the dock already does what you see")
@@ -1513,26 +1481,12 @@ impl DockStudio {
                     ui.label(RichText::new(text).size(13.0).color(pal.warn));
                 }
                 None => {
-                    let hint = match self.readiness() {
-                        Readiness::NeedsKarabiner => {
-                            "Install Karabiner-Elements to make your choices work."
-                        }
-                        Readiness::KarabinerStopped => {
-                            "Start Karabiner-Elements to make your choices work."
-                        }
-                        _ => "All saved. Pick a control to change it.",
-                    };
-                    ui.label(RichText::new(hint).size(13.0).color(pal.dim));
+                    ui.label(
+                        RichText::new("All saved. Pick a control to change it.")
+                            .size(13.0)
+                            .color(pal.dim),
+                    );
                 }
-            }
-            if cfg!(target_os = "macos") && !self.env.karabiner_installed {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.link("Get Karabiner-Elements").clicked() {
-                        let _ = std::process::Command::new("open")
-                            .arg("https://karabiner-elements.pqrs.org/")
-                            .spawn();
-                    }
-                });
             }
         });
         if self.show_activity {
@@ -1738,12 +1692,12 @@ fn help_controls(ui: &mut egui::Ui, pal: Palette) {
         (
             icon::APP_WINDOW,
             "Open application / Run command",
-            "Starts an app or runs a shell command you write. These run on the computer, so they need QuadKey (Linux) or Karabiner-Elements (macOS).",
+            "Starts an app or runs a shell command you write. The dock sends an unused key (F16-F22) and QuadKey, which must be open, does the rest.",
         ),
         (
             icon::TOGGLE_LEFT,
             "Toggle between two",
-            "The first press does one action, the next press the other - for example mute and unmute.",
+            "Alternates between two different actions, for example zoom in and zoom out. Mute / unmute, Play / Pause, the microphone and the camera already switch back by themselves - pick them directly. Needs QuadKey open.",
         ),
         (
             icon::PROHIBIT,
@@ -1791,12 +1745,12 @@ fn help_questions(ui: &mut egui::Ui, pal: Palette) {
             "Yes. Everything you choose is saved right away and survives restarts; Apply decides what the dock actually does.",
         ),
         (
-            "When is Karabiner-Elements needed?",
-            "Only for actions the dock cannot do by itself: opening an app, running a command, toggling between two actions, or doing nothing. Shortcuts and media keys are written into the dock and work on any computer without extra software.",
+            "Do I need Karabiner-Elements or keyd?",
+            "No. Everything is written into the dock. Opening apps and running commands also needs QuadKey to be open, because the dock cannot start programs by itself.",
         ),
         (
             "Why does a control still do the old thing?",
-            "Check the status in the top bar - it names what is missing (Apply, Karabiner-Elements or Input Monitoring).",
+            "Check the status in the top bar - it names what is missing (Apply or Input Monitoring).",
         ),
         (
             "Does the knob still change the volume?",
@@ -1804,7 +1758,7 @@ fn help_questions(ui: &mut egui::Ui, pal: Palette) {
         ),
         (
             "Does it work on Linux?",
-            "Yes, with keyd. Choose \"Shortcuts are for: Linux\" under More (⋯) if you mostly use the dock on Linux.",
+            "Yes. Choose \"Shortcuts are for: Linux\" under More (⋯) if you mostly use the dock on Linux.",
         ),
         (
             "How do I undo everything?",
@@ -2187,6 +2141,9 @@ mod tests {
             first: Box::new(Action::Media { key: Media::Mute }),
             second: Box::new(Action::Disabled),
         };
-        assert_eq!(action_name(&toggle, TargetOs::Mac), "Mute sound / Nothing");
+        assert_eq!(
+            action_name(&toggle, TargetOs::Mac),
+            "Mute / unmute sound / Nothing"
+        );
     }
 }

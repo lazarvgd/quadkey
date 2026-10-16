@@ -148,6 +148,23 @@ pub fn dock_setting(control: usize, action: &Action) -> Option<DockSetting> {
     })
 }
 
+/// A key nothing uses (F16..F22, one per control). The dock sends it for actions it cannot do
+/// itself - opening an app, running a command, doing nothing - and QuadKey carries them out.
+pub fn placeholder(control: usize) -> DockSetting {
+    DockSetting::Keys(vec![(2, 0x6B + control as u8)])
+}
+
+/// What to store in a control's slot: the dock's own setting when it has one, otherwise the
+/// placeholder key. For a toggle, the half that runs on the next press.
+pub fn slot_setting(control: usize, action: &Action, second_half: bool) -> DockSetting {
+    match action {
+        Action::Toggle { first, second } => {
+            slot_setting(control, if second_half { second } else { first }, false)
+        }
+        other => dock_setting(control, other).unwrap_or_else(|| placeholder(control)),
+    }
+}
+
 /// What the dock sends for a control after it was given `setting` - QuadKey recognises presses by it.
 pub fn trigger_for(control: usize, setting: &DockSetting) -> Option<Trigger> {
     match setting {
@@ -369,6 +386,29 @@ mod tests {
             trigger_for(2, &DockSetting::Function(80)),
             Some(crate::model::Config::default().buttons[2].trigger)
         );
+    }
+
+    #[test]
+    fn every_catalog_action_fits_in_the_dock() {
+        use crate::model::{TargetOs, presets_for};
+        for os in [TargetOs::Mac, TargetOs::Linux] {
+            for (preset, action) in presets_for(os) {
+                let in_dock = dock_setting(0, &action).is_some();
+                assert!(
+                    in_dock || matches!(action, Action::Command { .. }),
+                    "{} ({os:?}) can neither be stored in the dock nor run by QuadKey",
+                    preset.name
+                );
+                if in_dock {
+                    assert!(
+                        trigger_for(0, &dock_setting(0, &action).unwrap()).is_some()
+                            || matches!(action, Action::Media { .. }),
+                        "{} ({os:?}): QuadKey would not recognise the press",
+                        preset.name
+                    );
+                }
+            }
+        }
     }
 
     struct Fake(Vec<Vec<u8>>);
