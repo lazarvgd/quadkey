@@ -1395,15 +1395,18 @@ impl DockStudio {
                                 });
                         });
                     }
-                    ui.label(
-                        RichText::new(
-                            "Press once for the first action, again for the second, and so on. \
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Press once for the first action, again for the second, and so on. \
                              On/off actions such as Mute / unmute, Play / Pause, the microphone or \
                              the camera already switch back on the next press - choose them \
                              directly, no toggle needed.",
+                            )
+                            .size(12.0)
+                            .color(pal.dim),
                         )
-                        .size(12.0)
-                        .color(pal.dim),
+                        .wrap(),
                     );
                 });
             }

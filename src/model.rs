@@ -761,7 +761,7 @@ pub fn catalog() -> Vec<Preset> {
             "Capture the whole screen",
             i::CAMERA,
             keys(false, false, true, true, "3"),
-            keys(false, false, false, false, "print_screen"),
+            keys(false, false, true, false, "print_screen"),
         ),
         p(
             C::Screen,
@@ -769,7 +769,7 @@ pub fn catalog() -> Vec<Preset> {
             "Drag to select what to capture",
             i::CROP,
             keys(false, false, true, true, "4"),
-            keys(false, false, true, false, "print_screen"),
+            keys(false, false, false, false, "print_screen"),
         ),
         p(
             C::Screen,
@@ -782,7 +782,7 @@ pub fn catalog() -> Vec<Preset> {
         p(
             C::Screen,
             "Record the screen",
-            "Start a screen recording",
+            "Open the screen recording tools",
             i::RECORD,
             keys(false, false, true, true, "5"),
             keys(true, true, true, false, "r"),
@@ -808,7 +808,7 @@ pub fn catalog() -> Vec<Preset> {
             "Show desktop",
             "Move all windows out of the way",
             i::DESKTOP,
-            keys(false, false, false, true, "f3"),
+            keys(false, false, false, false, "f11"),
             keys(false, false, false, true, "d"),
         ),
         p(

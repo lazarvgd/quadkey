@@ -31,6 +31,22 @@ fn render_main_window() {
         app: "/Applications/Zoom.app".into(),
     };
     app.selected = 2;
+    if std::env::var("TOGGLE").is_ok() {
+        // The toggle editor, as after clicking "Toggle between two"
+        app.tab = quadkey::model::Category::Custom;
+        app.selected = 1;
+        let preset = |name: &str| {
+            quadkey::model::presets_for(quadkey::model::TargetOs::Mac)
+                .into_iter()
+                .find(|(p, _)| p.name == name)
+                .unwrap()
+                .1
+        };
+        app.config.buttons[1].action = Action::Toggle {
+            first: Box::new(preset("Zoom in")),
+            second: Box::new(preset("Zoom out")),
+        };
+    }
     let mut h = Harness::builder()
         .with_size(Vec2::new(1100.0, 860.0))
         .with_pixels_per_point(2.0)
